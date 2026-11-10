@@ -15,8 +15,11 @@ version = "0.1.1"
 hash = "3bc20d3a9be0c3729ebdab893c45aa922a2b6e4071b7eb2f1d10666c349925b0"
 
 [cose-nv]
-source = "path"
-path = "../cose-nv"
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "d953c799aa08b23025cc15fa2221d6fd2204baca74fd5573cd7c2ba575139ef3"
 
 [crypto-nv]
 source = "registry"

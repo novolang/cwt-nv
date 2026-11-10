@@ -17,4 +17,4 @@ novo        = ">= 0.23.0"
 
 [dependencies]
 cbor-nv = "^0.1.0"
-cose-nv = { path = "../cose-nv" }
+cose-nv = "^0.1.0"

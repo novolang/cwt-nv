@@ -1,0 +1,347 @@
+// cwt_edge_tests.nv — claims and their checking, beyond RFC 8392 appendix A.
+//
+// The appendix gives one claims set and three tokens.  These cases are
+// the rest of section 3: a time written as a float or under tag 1, a
+// claim of the wrong type, the boundaries of expiration and not-before
+// with and without leeway, the issuer and audience checks, and a token
+// that carries a valid signature over a payload that is not a claims set.
+
+use std.test
+use std.bytes
+use std.list
+use cborfmt
+use coseerr
+use cosekey
+use cosehdr
+use cosealg
+use cose
+use cosemsg
+use cwtclaim
+use cwtcheck
+use cwt
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn hex(b: Bytes) -> Str
+    bytes.to_hex(b)
+
+fn said<T>(r: Result<T, CoseError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+fn none() -> Bytes
+    bytes.zeros(0)
+
+fn oct(n: Int) -> CoseKey
+    var k = bytes.zeros(n)
+    for i in 0..n
+        bytes.set_u8(k, i, i * 7 + 3)
+    cosekey.symmetric(k)
+
+fn ed_key() -> CoseKey
+    cosekey.ed25519(h("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+                    Some(h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")))
+
+fn claim(label: Int, v: CborValue) -> CborPair
+    CborPair { key: CborUnsigned(label), value: v }
+
+fn from_pairs(pairs: [CborPair]) -> Result<CwtClaims, CoseError>
+    cwtclaim.claims_from_value(CborMap(pairs))
+
+fn full() -> CwtClaims
+    CwtClaims { iss: Some("issuer"), sub: Some("subject"), aud: Some("audience"), exp: Some(2000), nbf: Some(1000),
+                iat: Some(900), cti: Some(h("0b71")), extra: [] }
+
+fn at(now: Int) -> CwtRules
+    cwtcheck.rules_at(now)
+
+@test
+fn test_a_claims_set_is_written_in_deterministic_order_and_read_back() [io]
+    test.case("seven registered claims and two of another kind")
+    let c = CwtClaims { iss: Some("i"), sub: Some("s"), aud: Some("a"), exp: Some(200), nbf: Some(100), iat: Some(50),
+                        cti: Some(h("0b71")), extra: [CborPair { key: CborNegative(0 - 70000), value: CborText("private") },
+        claim(100, CborBool(true))] }
+    // a9 map of nine; 01 61 69; 02 61 73; 03 61 61; 04 18 c8; 05 18 64; 06 18 32; 07 42 0b71; 18 64 f5; 3a 0001116f 67 "private"
+    let wire = cwtclaim.claims_to_bytes(c)
+    test.assert_eq_str(hex(wire),
+        "a901616902617303616104" + "18c80518640618320742" + "0b711864f53a0001116f67" + "70726976617465")
+    match cwtclaim.claims_from_bytes(wire)
+        Err(_)   => test.fail("the claims were refused")
+        Ok(back) =>
+            test.assert_eq(back.iss, Some("i"))
+            test.assert_eq(back.sub, Some("s"))
+            test.assert_eq(back.aud, Some("a"))
+            test.assert_eq(back.exp, Some(200))
+            test.assert_eq(back.nbf, Some(100))
+            test.assert_eq(back.iat, Some(50))
+            test.assert_eq_str(hex(back.cti ?? none()), "0b71")
+            test.assert_eq(list.len(back.extra), 2)
+            test.assert_eq_str(hex(cwtclaim.claims_to_bytes(back)), hex(wire))
+    test.case("a claims set with nothing in it is the empty map")
+    test.assert_eq_str(hex(cwtclaim.claims_to_bytes(cwtclaim.claims_empty())), "a0")
+    test.assert_eq(cwtclaim.CWT_TAG, 61)
+    test.assert_eq(cwtclaim.CWT_ISS + cwtclaim.CWT_SUB + cwtclaim.CWT_AUD + cwtclaim.CWT_EXP + cwtclaim.CWT_NBF + cwtclaim.CWT_IAT + cwtclaim.CWT_CTI,
+        28)
+
+@test
+fn test_a_time_is_an_integer_a_float_or_either_under_tag_1() [io]
+    test.assert_eq(from_pairs([claim(4, CborUnsigned(1444064944))])!.exp, Some(1444064944))
+    test.assert_eq(from_pairs([claim(4, CborNegative(0 - 5))])!.exp, Some(0 - 5))
+    test.assert_eq(from_pairs([claim(4, CborFloat64(1444064944.75))])!.exp, Some(1444064944))
+    test.assert_eq(from_pairs([claim(4, CborFloat32(1000.0))])!.exp, Some(1000))
+    test.assert_eq(from_pairs([claim(4, CborFloat16(2.0))])!.exp, Some(2))
+    test.assert_eq(from_pairs([claim(5, CborTagged(1, CborUnsigned(77)))])!.nbf, Some(77))
+    test.assert_eq(from_pairs([claim(6, CborTagged(1, CborFloat64(12.5)))])!.iat, Some(12))
+    test.case("under another tag, or as text, it is not a time")
+    test.assert_eq_str(said(from_pairs([claim(4, CborTagged(2, CborUnsigned(1)))])), "cwt: claim 4 is malformed")
+    test.assert_eq_str(said(from_pairs([claim(5, CborText("tomorrow"))])), "cwt: claim 5 is malformed")
+    test.assert_eq_str(said(from_pairs([claim(6, CborBool(true))])), "cwt: claim 6 is malformed")
+
+@test
+fn test_a_registered_claim_of_the_wrong_type_is_refused() [io]
+    test.assert_eq_str(said(from_pairs([claim(1, CborUnsigned(1))])), "cwt: claim 1 is malformed")
+    test.assert_eq_str(said(from_pairs([claim(2, CborBytes(none()))])), "cwt: claim 2 is malformed")
+    test.assert_eq_str(said(from_pairs([claim(3, CborArray([CborText("a")]))])), "cwt: claim 3 is malformed")
+    test.assert_eq_str(said(from_pairs([claim(7, CborText("0b71"))])), "cwt: claim 7 is malformed")
+    test.assert_eq_str(said(cwtclaim.claims_from_value(CborArray([]))), "cwt: claim 0 is malformed")
+    test.assert_eq_str(said(cwtclaim.claims_from_bytes(h("ff"))),
+        "cose: not CBOR: cbor: the break byte at offset 0 closes nothing")
+    test.assert_eq_str(said(from_pairs([claim(1, CborText("a")), claim(1, CborText("b"))])),
+        "cose: header label 1 appears in both buckets or twice")
+    test.case("a claim of a kind this package does not know is kept, with its key")
+    match from_pairs([CborPair { key: CborText("x"), value: CborUnsigned(1) },
+        claim(0, CborNull),
+        claim(8, CborNull)])
+        Err(_) => test.fail("private claims were refused")
+        Ok(c)  => test.assert_eq(list.len(c.extra), 3)
+
+@test
+fn test_expiration_and_not_before_are_checked_at_their_boundaries() [io]
+    let c = full()
+    test.case("RFC 8392 section 3.1.4: before exp is valid, at exp is not")
+    test.assert_eq_str(said(cwtcheck.check(c, at(1999))), "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, at(2000))), "cwt: expired at 2000, now 2000")
+    test.assert_eq_str(said(cwtcheck.check(c, at(5000))), "cwt: expired at 2000, now 5000")
+    test.case("section 3.1.5: at nbf is valid, before it is not")
+    test.assert_eq_str(said(cwtcheck.check(c, at(1000))), "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, at(999))), "cwt: not valid before 1000, now 999")
+    test.case("leeway moves both lines outward by its amount")
+    let lee = CwtRules { now: 2000,
+        leeway: 30,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, lee)), "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, CwtRules { now: 2029,
+        leeway: 30,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false })),
+        "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, CwtRules { now: 2030,
+        leeway: 30,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false })),
+                       "cwt: expired at 2000, now 2030")
+    test.assert_eq_str(said(cwtcheck.check(c, CwtRules { now: 970,
+        leeway: 30,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false })),
+        "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, CwtRules { now: 969,
+        leeway: 30,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false })),
+                       "cwt: not valid before 1000, now 969")
+    test.case("a token with no nbf has no lower line")
+    test.assert_eq_str(said(cwtcheck.check(CwtClaims { iss: None,
+        sub: None,
+        aud: None,
+        exp: Some(2000),
+        nbf: None,
+        iat: None,
+        cti: None,
+        extra: [] },
+    at(0))),
+    "ok")
+    test.case("the issued-at time is informational")
+    test.assert_eq_str(said(cwtcheck.check(CwtClaims { iss: None,
+        sub: None,
+        aud: None,
+        exp: Some(2000),
+        nbf: None,
+        iat: Some(99999),
+        cti: None,
+        extra: [] },
+    at(1))),
+    "ok")
+
+@test
+fn test_a_token_without_an_expiration_time_is_refused_unless_the_policy_allows_it() [io]
+    let c = cwtclaim.claims_empty()
+    test.assert_eq_str(said(cwtcheck.check(c, at(1))), "cwt: claim 4 is required and absent")
+    test.assert_eq_str(said(cwtcheck.check(c, CwtRules { now: 1,
+        leeway: 0,
+        issuers: [],
+        audience: None,
+        require_exp: false,
+        require_nbf: false })),
+        "ok")
+    let p = cwtcheck.rules_at(5)
+    test.assert_eq(p.now, 5)
+    test.assert_eq(p.leeway, 0)
+    test.assert_eq(p.issuers, [])
+    test.assert_eq(p.audience, None)
+    test.assert_eq(p.require_exp, true)
+    test.assert_eq(p.require_nbf, false)
+
+@test
+fn test_issuer_and_audience_must_match_when_the_policy_names_them() [io]
+    let c = full()
+    let both = CwtRules { now: 1500,
+        leeway: 0,
+        issuers: ["issuer"],
+        audience: Some("audience"),
+        require_exp: true, require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, both)), "ok")
+    test.assert_eq_str(said(cwtcheck.check(c,
+        CwtRules { now: 1500,
+        leeway: 0,
+        issuers: ["other"],
+        audience: None,
+        require_exp: true,
+        require_nbf: false })),
+                       "cwt: the issuer is not the one required")
+    test.assert_eq_str(said(cwtcheck.check(c,
+        CwtRules { now: 1500,
+        leeway: 0,
+        issuers: [],
+        audience: Some("other"),
+        require_exp: true,
+        require_nbf: false })),
+                       "cwt: the audience is not the one required")
+    test.case("a claim the token does not carry cannot match")
+    let bare = CwtClaims { iss: None,
+        sub: None,
+        aud: None,
+        exp: Some(2000),
+        nbf: None,
+        iat: None,
+        cti: None,
+        extra: [] }
+    test.assert_eq_str(said(cwtcheck.check(bare, both)), "cwt: the issuer is not the one required")
+    test.assert_eq_str(said(cwtcheck.check(bare,
+        CwtRules { now: 1500,
+        leeway: 0,
+        issuers: [],
+        audience: Some("audience"),
+        require_exp: true,
+        require_nbf: false })),
+                       "cwt: the audience is not the one required")
+    test.case("the order is issuer, audience, expiration, not-before")
+    let all_wrong = CwtRules { now: 5000,
+        leeway: 0,
+        issuers: ["x"],
+        audience: Some("y"),
+        require_exp: true,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, all_wrong)), "cwt: the issuer is not the one required")
+
+@test
+fn test_a_signed_cwt_is_checked_signature_first_then_claims_then_clock() [io]
+    let key = ed_key()
+    let pubkey = cosekey.public_part(key)
+    let kid = cosehdr.with_kid(cosehdr.empty(), bytes.from_str("k"))
+    for wrapped in [true, false]
+        let token = cwt.sign1(CoseEdDSA, key, cosehdr.empty(), kid, full(), none(), wrapped)!
+        test.assert_eq_str(hex(bytes.slice(token, 0, 3)), lead(wrapped))
+        let claims = cwt.open_as(CwtSigned, token, CoseEdDSA, pubkey, none(), at(1500))!
+        test.assert_eq(claims.iss, Some("issuer"))
+        test.assert_eq(claims.exp, Some(2000))
+        test.assert_eq_str(said(cwt.open_as(CwtSigned, token, CoseEdDSA, pubkey, none(), at(2500))),
+            "cwt: expired at 2000, now 2500")
+        test.assert_eq_str(said(cwt.open_as(CwtSigned, token, CoseEdDSA, pubkey, text_aad(), at(1500))),
+            "cose: the signature or tag did not verify")
+        test.assert_eq_str(said(cwt.open_as(CwtSigned, token, CoseEs256, pubkey, none(), at(1500))),
+            "cose: the message names algorithm -8, the verifier asked for -7")
+    test.case("a valid signature over something that is not a claims set")
+    let not_claims = cose.sign1(CoseEdDSA, key, cosehdr.empty(), kid, h("80"), none(), false)!
+    let wire = cosemsg_bytes(not_claims)
+    test.assert_eq_str(said(cwt.open_as(CwtSigned, wire, CoseEdDSA, pubkey, none(), at(1))),
+        "cwt: claim 0 is malformed")
+    let not_cbor = cose.sign1(CoseEdDSA, key, cosehdr.empty(), kid, h("ff"), none(), false)!
+    test.assert_eq_str(said(cwt.open_as(CwtSigned, cosemsg_bytes(not_cbor), CoseEdDSA, pubkey, none(), at(1))),
+                       "cose: not CBOR: cbor: the break byte at offset 0 closes nothing")
+    test.case("bytes that are not CBOR at all, and a message of another kind")
+    test.assert_eq_str(said(cwt.open_as(CwtSigned, h("ff"), CoseEdDSA, pubkey, none(), at(1))),
+        "cose: not CBOR: cbor: the break byte at offset 0 closes nothing")
+    test.assert_eq_str(said(cwt.open_as(CwtSigned, h("d18443a1010540a040"), CoseEdDSA, pubkey, none(), at(1))),
+        "cose: tag 17 where tag 18 was expected")
+
+// The first three bytes of a signed CWT: tag 61 then tag 18 when wrapped,
+// tag 18 then the array of four and the protected header's head when not.
+fn lead(wrapped: Bool) -> Str
+    if wrapped
+        "d83dd2"
+    else
+        "d28443"
+
+fn text_aad() -> Bytes
+    bytes.from_str("other")
+
+fn cosemsg_bytes(m: CoseSign1) -> Bytes
+    cosemsg.sign1_to_bytes(m, true)
+
+@test
+fn test_a_maced_cwt_and_an_encrypted_cwt_round_trip() [io]
+    let key = oct(32)
+    for wrapped in [true, false]
+        let token = cwt.mac0(CoseHmac256, key, cosehdr.empty(), cosehdr.empty(), full(), none(), wrapped)!
+        test.assert_eq(cwt.open_as(CwtMaced, token, CoseHmac256, key, none(), at(1500))!.sub, Some("subject"))
+        test.assert_eq_str(said(cwt.open_as(CwtMaced, token, CoseHmac256, key, none(), at(2000))),
+            "cwt: expired at 2000, now 2000")
+        test.assert_eq_str(said(cwt.open_as(CwtMaced, token, CoseHmac256, oct(33), none(), at(1500))),
+            "cose: the signature or tag did not verify")
+        let key_enc = oct(16)
+        let iv = h("000102030405060708090a0b")
+        let sealed = cwt.encrypt0(CoseA128Gcm, key_enc, iv, cosehdr.empty(), cosehdr.empty(), full(), none(), wrapped)!
+        test.assert_eq(cwt.open_as(CwtEncrypted, sealed, CoseA128Gcm, key_enc, none(), at(1500))!.aud,
+            Some("audience"))
+        test.assert_eq_str(said(cwt.open_as(CwtEncrypted, sealed, CoseA128Gcm, key_enc, none(), at(999))),
+            "cwt: not valid before 1000, now 999")
+        test.assert_eq_str(said(cwt.open_as(CwtEncrypted, sealed, CoseA128Gcm, oct(17), none(), at(1500))),
+            "cose: unusable key: k is 17 bytes, the algorithm needs 16")
+
+@test
+fn test_a_token_with_no_tag_at_all_is_read_as_the_message_the_caller_asked_for() [io]
+    let key = ed_key()
+    let m = cose.sign1(CoseEdDSA,
+        key,
+        cosehdr.empty(),
+        cosehdr.empty(),
+        cwtclaim.claims_to_bytes(full()),
+        none(),
+        false)!
+    let bare = cosemsg.sign1_to_bytes(m, false)
+    test.assert_eq_str(hex(bytes.slice(bare, 0, 1)), "84")
+    test.assert_eq(cwt.open_as(CwtSigned, bare, CoseEdDSA, cosekey.public_part(key), none(), at(1500))!.iss,
+        Some("issuer"))
+
+@test
+fn test_the_claims_are_a_map_of_one_pair_per_claim_present() [io]
+    match cwtclaim.claims_to_value(full())
+        CborMap(entries) => test.assert_eq(list.len(entries), 7)
+        _                => test.fail("claims are a map")
+    match cwtclaim.claims_to_value(cwtclaim.claims_empty())
+        CborMap(entries) => test.assert_eq(list.len(entries), 0)
+        _                => test.fail("claims are a map")

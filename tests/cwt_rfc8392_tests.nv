@@ -21,10 +21,12 @@
 
 use std.test
 use std.bytes
+use std.list
 use coseerr
 use cosekey
+use cosehdr
 use cosealg
-use cosecwt
+use cosemsg
 use cwt
 use cwtcheck
 use cwtclaim
@@ -38,6 +40,9 @@ fn hex(b: Bytes) -> Str
 
 fn claims_hex() -> Str
     "a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71"
+
+fn key128_hex() -> Str
+    "a42050231f4c4d4d3051fdc2ec0a3851d5b3830104024c53796d6d6574726963313238030a"
 
 fn key256_hex() -> Str
     "a4205820403697de87af64611c1d32a05dab0fe1fcb715a86ab435f1ec99192d795693880104024c53796d6d6574726963323536030a"
@@ -70,7 +75,7 @@ fn mac_key() -> CoseKey
 @test
 fn test_a1_the_claims_set_reads_and_has_no_confirmation() [io]
     test.case("A.1: every registered claim")
-    match cosecwt.claims_from_bytes(h(claims_hex()))
+    match cwtclaim.claims_from_bytes(h(claims_hex()))
         Err(_) => test.fail("A.1 was refused")
         Ok(c)  =>
             test.assert_eq(c.iss, Some("coap://as.example.com"))
@@ -83,6 +88,37 @@ fn test_a1_the_claims_set_reads_and_has_no_confirmation() [io]
             test.case("A.1: no cnf and no private claim")
             test.assert_eq(cwtcnf.cnf_of(c), Ok(None))
             test.assert_eq(cwtclaim.claim_of(c, 8) == None, true)
+            test.assert_eq(list.len(c.extra), 0)
+            test.case("A.1: written again, the same bytes (the keys are already in deterministic order)")
+            test.assert_eq_str(hex(cwtclaim.claims_to_bytes(c)), claims_hex())
+
+@test
+fn test_a2_the_keys_read() [io]
+    test.case("A.2.2: a 256-bit symmetric key; its hex says alg 10 where its diagram says HMAC 256/64")
+    let k = key_of(key256_hex())
+    test.assert_eq(k.kty, 4)
+    test.assert_eq(k.alg, Some(10))
+    test.assert_eq_str(hex(k.kid ?? bytes.zeros(0)), "53796d6d6574726963323536")
+    test.assert_eq_str(hex(k.k ?? bytes.zeros(0)), "403697de87af64611c1d32a05dab0fe1fcb715a86ab435f1ec99192d79569388")
+    test.case("A.2.1: a 128-bit symmetric key")
+    let s = key_of(key128_hex())
+    test.assert_eq(s.alg, Some(10))
+    test.assert_eq_str(hex(s.k ?? bytes.zeros(0)), "231f4c4d4d3051fdc2ec0a3851d5b383")
+    test.case("A.2.3: a P-256 key with its private scalar")
+    let e = key_of(keyec_hex())
+    test.assert_eq(e.kty, 2)
+    test.assert_eq(e.crv, Some(1))
+    test.assert_eq(e.alg, Some(0 - 7))
+    test.assert_eq_str(hex(e.x ?? bytes.zeros(0)), "143329cce7868e416927599cf65a34f3ce2ffda55a7eca69ed8919a394d42f0f")
+    test.assert_eq_str(hex(e.y ?? bytes.zeros(0)), "60f7f1a780d8a783bfb7a2dd6b2796e8128dbbcef9d3d168db9529971a36e7b9")
+    test.assert_eq_str(hex(e.d ?? bytes.zeros(0)), "6c1382765aec5358f117733d281c1c7bdc39884d04a45a1e6c67c858bc206c19")
+    test.case("a key written and read again is the same key")
+    match cosekey.key_from_bytes(cosekey.key_to_bytes(e))
+        Err(_)    => test.fail("the rewritten key was refused")
+        Ok(again) =>
+            test.assert_eq_str(hex(again.x ?? bytes.zeros(0)), hex(e.x ?? bytes.zeros(0)))
+            test.assert_eq_str(hex(again.d ?? bytes.zeros(0)), hex(e.d ?? bytes.zeros(0)))
+            test.assert_eq(again.crv, e.crv)
 
 @test
 fn test_a3_the_signed_token_is_named_verified_and_checked() [io]
@@ -116,6 +152,14 @@ fn test_a3_the_signed_token_is_named_verified_and_checked() [io]
     test.case("A.3: another algorithm is refused before the signature is looked at")
     test.assert_eq_str(said(cwt.open(h(signed_hex()), CoseEdDSA, key, none, cwtcheck.rules_at(1444064943))),
                        "cose: the message names algorithm -7, the verifier asked for -8")
+    test.case("A.3: a signature made here under the private key verifies the same way")
+    match cwtclaim.claims_from_bytes(h(claims_hex()))
+        Err(_) => test.fail("A.1 was refused")
+        Ok(c)  =>
+            let unprot = cosehdr.with_kid(cosehdr.empty(), h("4173796d6d65747269634543445341323536"))
+            match cwt.sign1(CoseEs256, key_of(keyec_hex()), cosehdr.empty(), unprot, c, none, false)
+                Err(_)    => test.fail("sign1 refused")
+                Ok(token) => test.assert_eq_str(said(cwt.open(token, CoseEs256, key, none, cwtcheck.rules_at(1444064943))), "ok")
 
 @test
 fn test_a4_the_maced_token_under_tag_61_is_named_verified_and_rebuilt() [io]
@@ -132,7 +176,7 @@ fn test_a4_the_maced_token_under_tag_61_is_named_verified_and_rebuilt() [io]
                                      cwtcheck.rules_at(1444064943))),
                        "cose: the key is for algorithm 10, the operation uses 4")
     test.case("A.4: rebuilt from the claims, the same bytes")
-    match cosecwt.claims_from_bytes(h(claims_hex()))
+    match cwtclaim.claims_from_bytes(h(claims_hex()))
         Err(_) => test.fail("A.1 was refused")
         Ok(c)  =>
             match cwt.issue_maced(CoseHmac256x64, mac_key(), Some(h("53796d6d6574726963323536")), c, none, true)
@@ -153,3 +197,11 @@ fn test_a5_the_encrypted_token_is_named_and_its_algorithm_is_refused() [io]
     test.assert_eq_str(said(cwt.open(h(encrypted_hex()), CoseA128Gcm, key, bytes.zeros(0),
                                      cwtcheck.rules_at(1444064943))),
                        "cose: the message names algorithm 10, the verifier asked for 1")
+    test.case("A.5: algorithm 10 is not implemented")
+    match cosealg.alg_of_id(10)
+        Ok(_)  => test.fail("algorithm 10 is not implemented")
+        Err(e) => test.assert_eq_str(e.message(), "cose: algorithm 10 is not implemented")
+    test.case("A.5: the token still reads as a COSE_Encrypt0 under tag 16")
+    match cosemsg.encrypt0_from_bytes(h(encrypted_hex()))
+        Err(_) => test.fail("A.5 does not read")
+        Ok(m)  => test.assert_eq_str(hex(m.protected), "a1010a")

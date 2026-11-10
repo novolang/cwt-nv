@@ -14,7 +14,7 @@
 
 use std.list
 use coseerr
-use cosecwt
+use cwtclaim
 
 // What a check requires.
 //
@@ -64,7 +64,7 @@ pub fn rules_at(now: Int) -> CwtRules []
 // `CwtExpired` and `CwtNotYetValid`.
 //
 // ```novo
-// use cosecwt
+// use cwtclaim
 // use cwtcheck
 //
 // fn main() [io]
@@ -103,7 +103,7 @@ fn check_expiry(exp: ?Int, r: CwtRules) -> Result<Unit, CoseError>
     match exp
         None    =>
             if r.require_exp
-                Err(CwtMissingClaim(cosecwt.CWT_EXP))
+                Err(CwtMissingClaim(cwtclaim.CWT_EXP))
             else
                 Ok(())
         Some(e) =>
@@ -116,7 +116,7 @@ fn check_not_before(nbf: ?Int, r: CwtRules) -> Result<Unit, CoseError>
     match nbf
         None    =>
             if r.require_nbf
-                Err(CwtMissingClaim(cosecwt.CWT_NBF))
+                Err(CwtMissingClaim(cwtclaim.CWT_NBF))
             else
                 Ok(())
         Some(n) =>

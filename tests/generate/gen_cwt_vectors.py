@@ -39,7 +39,7 @@ vectors = {
 }
 
 here = os.path.dirname(os.path.abspath(__file__))
-text = open(os.path.join(here, "cwt_rfc8392_template.nv")).read()
+text = open(os.path.join(here, "cwt_rfc8392_tests.nv.in")).read()
 for k, v in vectors.items():
     text = text.replace(k, v)
 open(os.path.join(here, "..", "cwt_rfc8392_tests.nv"), "w").write(text)

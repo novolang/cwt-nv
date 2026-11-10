@@ -26,7 +26,7 @@ use cosehdr
 use cosealg
 use cosemsg
 use cose
-use cosecwt
+use cwtclaim
 use cwtcheck
 
 // What a token is, by the COSE message it wraps.
@@ -42,7 +42,7 @@ pub enum CwtKind
 fn untagged(v: CborValue) -> CborValue
     match v
         CborTagged(t, inner) =>
-            if t == cosecwt.CWT_TAG
+            if t == cwtclaim.CWT_TAG
                 inner
             else
                 v
@@ -54,7 +54,7 @@ fn untagged(v: CborValue) -> CborValue
 pub fn is_tagged(src: Bytes) -> Result<Bool, CoseError> []
     let v = cosecbor.decode_value(src)!
     match v
-        CborTagged(t, _) => Ok(t == cosecwt.CWT_TAG)
+        CborTagged(t, _) => Ok(t == cwtclaim.CWT_TAG)
         _                => Ok(false)
 
 // The kind of token an encoding holds, from its COSE tag, with or without
@@ -93,14 +93,14 @@ pub fn kind_of(src: Bytes) -> Result<?CwtKind, CoseError> []
 // has verified and the claims have passed `rules`.
 //
 // The refusals are those of `cose.verify_sign1`, `cose.verify_mac0` or
-// `cose.decrypt0`, the claim refusals of `cosecwt.claims_from_bytes`, and
+// `cose.decrypt0`, the claim refusals of `cwtclaim.claims_from_bytes`, and
 // `cwtcheck.check`'s.
 pub fn open_as(kind: CwtKind, src: Bytes, a: CoseAlg, key: CoseKey, external_aad: Bytes,
                rules: CwtRules) -> Result<CwtClaims, CoseError> []
     let v = cosecbor.decode_value(src)!
     let inner = untagged(v)
     let payload = payload_of(kind, inner, a, key, external_aad)!
-    let claims = cosecwt.claims_from_bytes(payload)!
+    let claims = cwtclaim.claims_from_bytes(payload)!
     cwtcheck.check(claims, rules)!
     Ok(claims)
 
@@ -142,24 +142,59 @@ pub fn open(src: Bytes, a: CoseAlg, key: CoseKey, external_aad: Bytes,
         None       => Err(CoseBadStructure("cwt: the message has no COSE tag; name its kind with open_as"))
         Some(kind) => open_as(kind, src, a, key, external_aad, rules)
 
+// Sign `claims` into a CWT: a COSE_Sign1, tagged 18, under tag 61 when
+// `tagged_cwt`.  The arguments after the claims are `cose.sign1`'s, and the
+// two headers are the caller's; `issue_signed` is this with an empty
+// protected header and a key identifier.
+//
+// Refuses what `cose.sign1` refuses.
+pub fn sign1(a: CoseAlg, key: CoseKey, protected: CoseHeaders, unprotected: CoseHeaders,
+             claims: CwtClaims, external_aad: Bytes,
+             tagged_cwt: Bool) -> Result<Bytes, CoseError> []
+    let m = cose.sign1(a, key, protected, unprotected, cwtclaim.claims_to_bytes(claims), external_aad, false)!
+    Ok(cosecbor.encode_value(wrap(tagged_cwt, cosemsg.sign1_to_value(m, true))))
+
+// Authenticate `claims` into a CWT: a COSE_Mac0, tagged 17.  `sign1`'s
+// counterpart.
+pub fn mac0(a: CoseAlg, key: CoseKey, protected: CoseHeaders, unprotected: CoseHeaders,
+            claims: CwtClaims, external_aad: Bytes, tagged_cwt: Bool) -> Result<Bytes, CoseError> []
+    let m = cose.mac0(a, key, protected, unprotected, cwtclaim.claims_to_bytes(claims), external_aad, false)!
+    Ok(cosecbor.encode_value(wrap(tagged_cwt, cosemsg.mac0_to_value(m, true))))
+
+// Encrypt `claims` into a CWT: a COSE_Encrypt0, tagged 16.  `iv` is the
+// 12-byte nonce, as for `cose.encrypt0`.  `sign1`'s counterpart.
+pub fn encrypt0(a: CoseAlg, key: CoseKey, iv: Bytes, protected: CoseHeaders,
+                unprotected: CoseHeaders, claims: CwtClaims, external_aad: Bytes,
+                tagged_cwt: Bool) -> Result<Bytes, CoseError> []
+    let m = cose.encrypt0(a, key, iv, protected, unprotected, cwtclaim.claims_to_bytes(claims), external_aad, false)!
+    Ok(cosecbor.encode_value(wrap(tagged_cwt, cosemsg.encrypt0_to_value(m, true))))
+
+// The CBOR value of a token with the CWT tag, when asked for, outside
+// the COSE tag.
+fn wrap(tagged_cwt: Bool, v: CborValue) -> CborValue
+    if tagged_cwt
+        CborTagged(cwtclaim.CWT_TAG, v)
+    else
+        v
+
 // A signed token: a COSE_Sign1 under tag 18, the key identifier `kid` in
 // the unprotected header when there is one, and the CWT tag outside when
 // `tagged_cwt`.
 pub fn issue_signed(a: CoseAlg, key: CoseKey, kid: ?Bytes, claims: CwtClaims, external_aad: Bytes,
                     tagged_cwt: Bool) -> Result<Bytes, CoseError> []
-    cosecwt.sign1(a, key, cosehdr.empty(), kid_header(kid), claims, external_aad, tagged_cwt)
+    sign1(a, key, cosehdr.empty(), kid_header(kid), claims, external_aad, tagged_cwt)
 
 // A MACed token: a COSE_Mac0 under tag 17.
 pub fn issue_maced(a: CoseAlg, key: CoseKey, kid: ?Bytes, claims: CwtClaims, external_aad: Bytes,
                    tagged_cwt: Bool) -> Result<Bytes, CoseError> []
-    cosecwt.mac0(a, key, cosehdr.empty(), kid_header(kid), claims, external_aad, tagged_cwt)
+    mac0(a, key, cosehdr.empty(), kid_header(kid), claims, external_aad, tagged_cwt)
 
 // An encrypted token: a COSE_Encrypt0 under tag 16.  `iv` is the nonce the
 // algorithm takes, 12 bytes for AES-GCM and ChaCha20/Poly1305, and it must
 // never repeat under one key.
 pub fn issue_encrypted(a: CoseAlg, key: CoseKey, iv: Bytes, kid: ?Bytes, claims: CwtClaims,
                        external_aad: Bytes, tagged_cwt: Bool) -> Result<Bytes, CoseError> []
-    cosecwt.encrypt0(a, key, iv, cosehdr.empty(), kid_header(kid), claims, external_aad, tagged_cwt)
+    encrypt0(a, key, iv, cosehdr.empty(), kid_header(kid), claims, external_aad, tagged_cwt)
 
 fn kid_header(kid: ?Bytes) -> CoseHeaders
     match kid

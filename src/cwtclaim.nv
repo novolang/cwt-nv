@@ -1,23 +1,178 @@
-// cwtclaim.nv — the claim keys of RFC 8392 and the ranges that govern them.
+// cwtclaim.nv — the claims of a CWT: their keys, their encoding, and the
+// ranges that govern the keys.
 //
-// A CWT claims set is a CBOR map.  Its keys are integers or text strings,
-// and the integers are allocated from one registry whose ranges decide who
-// may use a number (RFC 8392 section 9.1, the CBOR Web Token Claims
-// registry).  The registered claims are the issuer (1), the subject (2),
-// the audience (3), the expiration time (4), the not-before time (5), the
-// issued-at time (6) and the token identifier (7).  Key 8, `cnf`, is the
-// confirmation claim of RFC 8747 and RFC 9200 builds on it.
+// A CWT claims set is a CBOR map (RFC 8392 section 3).  Its keys are
+// integers or text strings, and the integers are allocated from one
+// registry whose ranges decide who may use a number (section 9.1, the CBOR
+// Web Token Claims registry).  The registered claims are the issuer (1),
+// the subject (2), the audience (3), the expiration time (4), the
+// not-before time (5), the issued-at time (6) and the token identifier (7).
+// Key 8, `cnf`, is the confirmation claim of RFC 8747 and RFC 9200 builds
+// on it.
 //
-// `cose-nv` reads the seven registered claims into a `CwtClaims` and keeps
-// every other pair in `extra`.  The functions here are what a program needs
-// to read and write those other pairs by key, and to choose a key that
-// cannot collide with a registered one.
+// `CwtClaims` holds the seven registered claims in fields and keeps every
+// other pair in `extra`, with its key, and writes it back.  A time is a
+// NumericDate: seconds since the epoch as an integer or a float,
+// optionally under tag 1.  The whole token may carry the CWT tag, 61,
+// outside the COSE tag (section 6).
+//
+// The functions after the encoding are what a program needs to read and
+// write the claims in `extra` by key, and to choose a key that cannot
+// collide with a registered one.
 
+use std.bytes
 use std.list
 use cborfmt
 use coseerr
 use cosecbor
-use cosecwt
+
+// The tag that marks a CBOR value as a CWT (RFC 8392 section 6).
+pub const CWT_TAG = 61
+
+// The issuer claim key (RFC 8392 section 3.1.1).
+pub const CWT_ISS = 1
+// The subject claim key (section 3.1.2).
+pub const CWT_SUB = 2
+// The audience claim key (section 3.1.3).
+pub const CWT_AUD = 3
+// The expiration time claim key (section 3.1.4).
+pub const CWT_EXP = 4
+// The not-before time claim key (section 3.1.5).
+pub const CWT_NBF = 5
+// The issued-at time claim key (section 3.1.6).
+pub const CWT_IAT = 6
+// The token identifier claim key (section 3.1.7).
+pub const CWT_CTI = 7
+
+// A claims set.  A claim that is absent is `None`.
+pub struct CwtClaims
+    iss: ?Str
+    sub: ?Str
+    aud: ?Str
+    exp: ?Int
+    nbf: ?Int
+    iat: ?Int
+    cti: ?Bytes
+    extra: [CborPair]
+
+// A claims set with no claims.
+pub fn claims_empty() -> CwtClaims []
+    CwtClaims { iss: None,
+        sub: None,
+        aud: None,
+        exp: None,
+        nbf: None,
+        iat: None,
+        cti: None,
+        extra: [] }
+
+fn text_pair(label: Int, v: ?Str) -> [CborPair]
+    match v
+        Some(s) => [CborPair { key: cosecbor.int_value(label), value: CborText(s) }]
+        None    => []
+
+fn time_pair(label: Int, v: ?Int) -> [CborPair]
+    match v
+        Some(t) => [CborPair { key: cosecbor.int_value(label), value: cosecbor.int_value(t) }]
+        None    => []
+
+// The claims as a CBOR map.
+pub fn claims_to_value(c: CwtClaims) -> CborValue []
+    var entries: [CborPair] = []
+    list.append(entries, text_pair(CWT_ISS, c.iss))
+    list.append(entries, text_pair(CWT_SUB, c.sub))
+    list.append(entries, text_pair(CWT_AUD, c.aud))
+    list.append(entries, time_pair(CWT_EXP, c.exp))
+    list.append(entries, time_pair(CWT_NBF, c.nbf))
+    list.append(entries, time_pair(CWT_IAT, c.iat))
+    match c.cti
+        Some(b) => list.push(entries, CborPair { key: cosecbor.int_value(CWT_CTI), value: CborBytes(b) })
+        None    => 0
+    list.append(entries, c.extra)
+    CborMap(entries)
+
+// The claims in the core deterministic encoding: the payload of a
+// signed, authenticated or encrypted CWT.
+pub fn claims_to_bytes(c: CwtClaims) -> Bytes []
+    cosecbor.encode_value(claims_to_value(c))
+
+// A NumericDate as whole seconds: an integer, or a float truncated
+// toward zero, under an optional tag 1.
+fn numeric_date(v: CborValue) -> ?Int
+    match v
+        CborTagged(t, inner) =>
+            if t == 1
+                numeric_date(inner)
+            else
+                None
+        CborFloat16(f)       => Some(f as Int)
+        CborFloat32(f)       => Some(f as Int)
+        CborFloat64(f)       => Some(f as Int)
+        _                    => cosecbor.int_of(v)
+
+fn text_claim(entries: [CborPair], label: Int) -> Result<?Str, CoseError>
+    match cosecbor.find(entries, label)
+        None    => Ok(None)
+        Some(v) =>
+            match v
+                CborText(s) => Ok(Some(s))
+                _           => Err(CwtBadClaim(label))
+
+fn time_claim(entries: [CborPair], label: Int) -> Result<?Int, CoseError>
+    match cosecbor.find(entries, label)
+        None    => Ok(None)
+        Some(v) =>
+            match numeric_date(v)
+                Some(t) => Ok(Some(t))
+                None    => Err(CwtBadClaim(label))
+
+fn cti_claim(entries: [CborPair]) -> Result<?Bytes, CoseError>
+    match cosecbor.find(entries, CWT_CTI)
+        None    => Ok(None)
+        Some(v) =>
+            match v
+                CborBytes(b) => Ok(Some(bytes.clone(b)))
+                _            => Err(CwtBadClaim(CWT_CTI))
+
+// The claims a CBOR map holds.
+//
+// Refuses `CwtBadClaim` for a value that is not a map or a registered
+// claim of the wrong type, and `CoseDuplicateLabel` for a claim key that
+// appears twice.
+pub fn claims_from_value(v: CborValue) -> Result<CwtClaims, CoseError> []
+    match v
+        CborMap(entries) => claims_from_entries(entries)
+        _                => Err(CwtBadClaim(0))
+
+fn claims_from_entries(entries: [CborPair]) -> Result<CwtClaims, CoseError>
+    match cosecbor.duplicate_label(entries)
+        Some(l) => Err(CoseDuplicateLabel(l))
+        None    =>
+            let iss = text_claim(entries, CWT_ISS)!
+            let sub = text_claim(entries, CWT_SUB)!
+            let aud = text_claim(entries, CWT_AUD)!
+            let exp = time_claim(entries, CWT_EXP)!
+            let nbf = time_claim(entries, CWT_NBF)!
+            let iat = time_claim(entries, CWT_IAT)!
+            let cti = cti_claim(entries)!
+            Ok(CwtClaims { iss: iss, sub: sub, aud: aud, exp: exp, nbf: nbf, iat: iat, cti: cti,
+                           extra: others(entries) })
+
+// The pairs whose key is not one of the seven registered claims.
+fn others(entries: [CborPair]) -> [CborPair]
+    var out: [CborPair] = []
+    for p in entries
+        match cosecbor.int_of(p.key)
+            Some(l) =>
+                if not is_registered(l)
+                    list.push(out, p)
+            None    => list.push(out, p)
+    out
+
+// The claims in a byte string.
+pub fn claims_from_bytes(src: Bytes) -> Result<CwtClaims, CoseError> []
+    let v = cosecbor.decode_value(src)!
+    claims_from_value(v)
 
 // The confirmation claim, RFC 8747 section 3.1.
 pub const CWT_CNF = 8
@@ -92,11 +247,10 @@ pub fn private_claim(key: Int, value: CborValue) -> Result<CborPair, CoseError> 
 //
 // ```novo
 // use cborfmt
-// use cosecwt
 // use cwtclaim
 //
 // fn main() [io]
-//     let c = cosecwt.claims_empty()
+//     let c = cwtclaim.claims_empty()
 //     match cwtclaim.with_claim(c, 0 - 70000, CborText("lab-3"))
 //         Ok(next) => println("${cwtclaim.claim_of(next, 0 - 70000) != None}")   // true
 //         Err(e)   => println(e.message())

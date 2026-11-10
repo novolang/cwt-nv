@@ -11,20 +11,25 @@ The first release.
 
 ### Added
 
+- **`cwtclaim`**, the claims of RFC 8392: `CwtClaims` with the seven
+  registered claims in fields and every other pair kept in `extra`, the claim
+  keys and the CWT tag 61, the claims set as a CBOR map and as bytes in the
+  core deterministic encoding, times read as integers, floats or either under
+  tag 1, the ranges of the claims registry (`key_range`, `is_private`),
+  `private_claim`, and `claim_of`, `with_claim` and `without_claim` for the
+  claims `CwtClaims` keeps in `extra`.
 - **`cwt`**, a token as bytes: `is_tagged` and `kind_of` read the CWT tag and
   the COSE tag, `open` verifies a COSE_Sign1, COSE_Mac0 or COSE_Encrypt0
   CWT, reads its claims and judges them, `open_as` does the same for a token
   whose COSE tag was left off, and `issue_signed`, `issue_maced` and
-  `issue_encrypted` make the three kinds, with the CWT tag when asked for.
+  `issue_encrypted` make the three kinds, with the CWT tag when asked for, and
+  `sign1`, `mac0` and `encrypt0` do the same with headers the caller builds.
 - **`cwtcheck`**, `CwtRules` and `check`: a list of trusted issuers, the
   audience the recipient answers to, expiration and not-before against a
   clock and a leeway the caller passes, and `require_exp` and `require_nbf`.
 - **`cwtcnf`**, the `cnf` claim of RFC 8747: `Cnf` for a COSE_Key, an
   encrypted key and a key identifier, `with_cnf`, `cnf_of`, `key_of` and
   `names_kid`.
-- **`cwtclaim`**, the ranges of the CWT claims registry (`key_range`,
-  `is_private`), `private_claim`, and `claim_of`, `with_claim` and
-  `without_claim` for the claims `CwtClaims` keeps in `extra`.
 - **`cwtdev`**, the claims of a token in a `Vec[u8; 512]` with no heap:
   `unwrap` removes the CWT tag, `scan` finds the registered claims and the
   `cnf` claim with its key identifier, `check` judges the times and
@@ -32,7 +37,7 @@ The first release.
 - **`tests/embedded_probe.nv`**, a firmware program for a door controller,
   built for `--target=nrf52-qemu`. It prints `PASS: cwt-embedded` under QEMU.
   The image is 20,528 bytes of flash and 528 bytes of static RAM.
-- Five test suites, among them RFC 8392 appendix A cut out of the RFC's text.
+- Six test suites, among them RFC 8392 appendix A cut out of the RFC's text.
 
 ### Not included
 
@@ -46,8 +51,8 @@ The first release.
 
 ### Known
 
-- This package overlaps cose-nv's `cosecwt` module, which already holds the
-  claims struct, its encoding and the validation of the seven registered
-  claims. This package builds on that module and does not replace it.
+- The key of RFC 8392 appendix A.2.2, as the RFC's hexadecimal writes it, names
+  algorithm 10 where the RFC's diagram says HMAC 256/64. A key's `alg` is
+  checked, so that key is refused for HMAC as written.
 
 This release requires novo 0.23.0 or later.

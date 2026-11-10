@@ -20,7 +20,7 @@ use cosehdr
 use cosealg
 use cosemsg
 use cose
-use cosecwt
+use cwtclaim
 use cwt
 use cwtcheck
 use cwtcnf
@@ -101,16 +101,16 @@ fn test_a_token_with_no_cose_tag_must_be_opened_with_its_kind_named() [io]
     test.assert_eq_str(said(cwt.open(h("80"), CoseHmac256, key, none(), at(1500))),
                        "cose: malformed structure: cwt: the message has no COSE tag; name its kind with open_as")
     test.case("a token with its tags taken off is opened as the kind the caller names")
-    match cosecwt.mac0(CoseHmac256, key, cosehdr.empty(), cosehdr.empty(), claims(), none(), false)
+    match cwt.mac0(CoseHmac256, key, cosehdr.empty(), cosehdr.empty(), claims(), none(), false)
         Err(_)     => test.fail("mac0 refused")
         Ok(tagged) =>
-            match cosecwt_untagged(tagged)
+            match untag_mac0(tagged)
                 Err(_)   => test.fail("the token did not strip")
                 Ok(bare) =>
                     test.assert_eq_str(said(cwt.open_as(CwtMaced, bare, CoseHmac256, key, none(), at(1500))), "ok")
 
 // The MACed token with its 17 tag removed, by taking the array's bytes.
-fn cosecwt_untagged(tagged: Bytes) -> Result<Bytes, CoseError>
+fn untag_mac0(tagged: Bytes) -> Result<Bytes, CoseError>
     // d1 is the one-byte head of tag 17; the array follows.
     if bytes.len(tagged) > 1 and bytes.byte_at(tagged, 0) == Some(0xd1)
         Ok(bytes.slice(tagged, 1, bytes.len(tagged)))

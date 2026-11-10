@@ -19,22 +19,28 @@ mine, is it still good, and is it for me. This package answers the first
 from the tags, the second and third from the claims, and tells a program
 that has a heap and a program that has none how to ask.
 
-**The cryptography is cose-nv's.** `cose-nv` carries the COSE messages, the
-algorithms (EdDSA, ES256, the HMAC family, AES-GCM, ChaCha20/Poly1305) and
-the claims themselves in `cosecwt`. This package does not repeat them. It
-adds what a token's recipient needs around them:
+**The claims come first.** `CwtClaims` holds the seven registered claims of
+RFC 8392 section 3 in fields: the issuer, subject, audience, expiration time,
+not-before time, issued-at time and token identifier. Every other pair of the
+map is kept in `extra`, with its key, and written back. `cwtclaim` reads and
+writes the claims set, with the times as NumericDates (an integer or a float,
+with or without tag 1), and holds the claim registry's ranges. Around the
+claims the package has:
 
-- the **kind of a token from its tags**, with or without the CWT tag, and
-  one call, `cwt.open`, that dispatches on it, verifies, reads the claims
-  and judges them in the order RFC 8392 section 7.2 gives;
 - the **rules** a recipient judges claims by: a list of trusted issuers, the
   audience it answers to, a clock it passes, and a leeway;
 - the **`cnf` claim** of RFC 8747: a key, an encrypted key or a key
   identifier, written and read as a typed value;
-- the **claim registry's ranges**, so a private claim is chosen from the
-  range that is never allocated;
+- the **kind of a token from its tags**, with or without the CWT tag, and
+  one call, `cwt.open`, that dispatches on it, verifies, reads the claims
+  and judges them in the order RFC 8392 section 7.2 gives;
 - a **reader for a device with no heap** that finds every registered claim
   of a token in a 512-byte buffer.
+
+**The cryptography is cose-nv's.** `cose-nv` carries the COSE messages and the
+algorithms (EdDSA, ES256, the HMAC family, AES-GCM, ChaCha20/Poly1305). This
+package signs, MACs and encrypts a claims set with them and does not repeat
+them.
 
 **The clock is an argument.** Nothing here reads the time. The same token
 checks the same way in a test, in a replay and on a device with no
@@ -54,10 +60,10 @@ key identifier; the light opens it.
 ```novo
 use std.bytes
 use cosealg
-use cosecwt
 use cosekey
 use cwt
 use cwtcheck
+use cwtclaim
 use cwtcnf
 
 fn issue_and_open() -> Str
@@ -86,17 +92,11 @@ Build and test with `novo pkg build` and `novo test tests --isolate`.
 
 | Module | Contents |
 | --- | --- |
-| `cwt` | A token as bytes: `is_tagged`, `kind_of`, `open` and `open_as`, which verify and judge it, and `issue_signed`, `issue_maced` and `issue_encrypted`. |
+| `cwtclaim` | `CwtClaims`, the claim keys and the CWT tag, the claims set as a CBOR map or bytes (`claims_to_value`, `claims_to_bytes`, `claims_from_value`, `claims_from_bytes`), the ranges of the registry, private claims, and `claim_of`, `with_claim` and `without_claim` for any claim `CwtClaims` keeps in `extra`. |
 | `cwtcheck` | `CwtRules` and `check`: issuer list, audience, expiration and not-before against a clock the caller passes, with a leeway. |
 | `cwtcnf` | The `cnf` claim: `Cnf` with its three methods, `with_cnf`, `cnf_of`, `names_kid`. |
-| `cwtclaim` | The claim keys, the ranges of the registry, private claims, and `claim_of`, `with_claim` and `without_claim` for any claim `CwtClaims` keeps in `extra`. |
+| `cwt` | A token as bytes: `is_tagged`, `kind_of`, `open` and `open_as`, which verify and judge it, `issue_signed`, `issue_maced` and `issue_encrypted`, and `sign1`, `mac0` and `encrypt0`, which take the protected and unprotected headers themselves. |
 | `cwtdev` | The claims of a token in a `Vec[u8; 512]` with no heap: `unwrap`, `scan`, `check`, `region_is`. |
-
-`CwtClaims` itself, the seven registered claims in fields, is
-[cose-nv](https://novo-lang.org/packages/cose-nv)'s `cosecwt`. A program
-that only needs to sign and verify a token with a fixed policy can stop
-there; this package is for the recipient that sorts tokens, trusts several
-issuers, or binds a token to a key.
 
 Every `pub` declaration is documented where it is declared, and
 [the package's page](https://novo-lang.org/packages/cwt-nv) is that
@@ -115,9 +115,10 @@ reference.
    left off is opened with `open_as` and the kind the caller knows. The CWT
    tag, 61, outside it is accepted and never required, and one tag 61 is
    removed: a second is refused as a COSE tag.
-4. **Times are whole seconds the caller read.** A token is expired when `now`
-   is at or past `exp + leeway`, and not yet valid when `now` is before
-   `nbf - leeway`. The issued-at time is not checked; a recipient that wants
+4. **Times are whole seconds the caller read.** A time claim is an integer or a
+   float, with or without tag 1; a float is truncated toward zero. A token is
+   expired when `now` is at or past `exp + leeway`, and not yet valid when
+   `now` is before `nbf - leeway`. The issued-at time is not checked; a recipient that wants
    a maximum age compares it itself.
 5. **The checks run in a fixed order:** issuer, audience, expiration,
    not-before. A token that fails two reports the first.
@@ -150,7 +151,7 @@ reference.
 `Vec[u8; 512]`, the buffer of cose-nv's `cosedev`, which finds the parts of
 the COSE message and builds the string a signature or tag covers; a part of a
 message is a `Region`, an offset and a length, and nothing is copied. The
-four host modules and `cwt` use `Bytes` and CBOR trees, which are heap
+four host modules, `cwtclaim`, `cwtcheck`, `cwtcnf` and `cwt`, use `Bytes` and CBOR trees, which are heap
 objects, so they are named in `host_modules` and the registry shows the
 embedded tier for `cwtdev` alone.
 
@@ -195,9 +196,7 @@ input.
 ## Related packages
 
 - [cose-nv](https://novo-lang.org/packages/cose-nv) is the COSE layer this one
-  stands on, and its `cosecwt` module holds the claims struct, the
-  claims-set encoding and the validation of the registered claims. A program
-  with one trusted issuer and one audience can use it without this package.
+  stands on: the messages, the algorithms and the keys.
 - [cbor-nv](https://novo-lang.org/packages/cbor-nv) supplies the CBOR value tree
   that the `cnf` claim and the private claims are made of.
 - [jwt-nv](https://novo-lang.org/packages/jwt-nv) is the JSON counterpart, for
@@ -205,16 +204,25 @@ input.
 
 ## Tests
 
-The suite is five files under `tests/`.
+The suite is six files under `tests/`.
 
 `tests/cwt_rfc8392_tests.nv` holds the claims set, the keys and the three
-tokens of RFC 8392 appendix A: the signed token of A.3, verified against the
-public key of A.2.3; the MACed token of A.4, verified and rebuilt byte for
-byte; and the encrypted token of A.5, named and refused for its algorithm.
+tokens of RFC 8392 appendix A. The claims set of A.1 is read and written
+again byte for byte. The keys of A.2.1 to A.2.3 are read and rewritten. The
+signed token of A.3 is verified against the public key of A.2.3, and a token
+signed here under the private key verifies the same way. The MACed token of A.4
+is verified and rebuilt byte for byte. The encrypted token of A.5 is named and
+refused for its algorithm.
 `tests/generate/gen_cwt_vectors.py` cuts the hexadecimal strings out of the
-RFC's text, so no byte of them was typed. The key of A.2.2 is written in the
-RFC with `alg` 10 where its diagram says HMAC 256/64, and a test records that
-the key as written is refused for HMAC.
+RFC's text into the template next to it, so no byte of them was typed. The key
+of A.2.2 is written in the RFC with `alg` 10 where its diagram says HMAC
+256/64, and a test records that the key as written is refused for HMAC.
+
+`tests/cwt_edge_tests.nv` holds the claims set beyond the appendix: the
+deterministic order of the keys, a time written as an integer, a float or under
+tag 1, a registered claim of the wrong type, the boundaries of expiration and
+not-before with and without leeway, the issuer and audience checks, and a
+token with a valid signature over a payload that is not a claims set.
 
 `tests/cwt_claim_tests.nv` holds the ranges of the registry at their edges,
 the confirmation claim as bytes derived by hand from RFC 8747 section 3.1,

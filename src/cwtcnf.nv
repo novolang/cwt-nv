@@ -24,7 +24,6 @@ use cborfmt
 use coseerr
 use cosecbor
 use cosekey
-use cosecwt
 use cwtclaim
 
 // The confirmation method that carries a COSE_Key.
@@ -115,11 +114,11 @@ pub fn from_bytes(src: Bytes) -> Result<Cnf, CoseError> []
 //
 // ```novo
 // use std.bytes
-// use cosecwt
+// use cwtclaim
 // use cwtcnf
 //
 // fn main() [io]
-//     let set = cwtcnf.with_cnf(cosecwt.claims_empty(), CnfKid(bytes.from_str("k1")))
+//     let set = cwtcnf.with_cnf(cwtclaim.claims_empty(), CnfKid(bytes.from_str("k1")))
 //     match cwtcnf.cnf_of(set)
 //         Ok(Some(_)) => println("bound")
 //         _           => println("unbound")

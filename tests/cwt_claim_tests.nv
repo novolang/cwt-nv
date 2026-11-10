@@ -15,7 +15,6 @@ use std.bytes
 use cborfmt
 use coseerr
 use cosekey
-use cosecwt
 use cwtcheck
 use cwtclaim
 use cwtcnf
@@ -32,7 +31,7 @@ fn said<T>(r: Result<T, CoseError>) -> Str
         Err(e) => e.message()
 
 fn blank() -> CwtClaims
-    cosecwt.claims_empty()
+    cwtclaim.claims_empty()
 
 fn public_key() -> CoseKey
     cosekey.with_kid(cosekey.ed25519(h("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"), None),
@@ -77,7 +76,7 @@ fn test_a_private_claim_is_a_pair_only_in_the_private_range() [io]
     test.case("a key below -65536 gives the pair")
     match cwtclaim.private_claim(0 - 70000, CborText("lab-3"))
         Err(_) => test.fail("a private key was refused")
-        Ok(p)  => test.assert_eq_str(hex(cosecwt.claims_to_bytes(CwtClaims { iss: None, sub: None, aud: None,
+        Ok(p)  => test.assert_eq_str(hex(cwtclaim.claims_to_bytes(CwtClaims { iss: None, sub: None, aud: None,
                                                                               exp: None, nbf: None, iat: None, cti: None,
                                                                               extra: [p] })),
                                      "a13a0001116f656c61622d33")
@@ -185,7 +184,7 @@ fn test_a_claims_set_carries_one_confirmation_and_a_second_replaces_it() [io]
     test.assert_eq(cwtcnf.cnf_of(bound), Ok(Some(CnfKid(h("6b31")))))
     test.assert_eq(bound.exp, Some(2000))
     test.case("the set is written with key 8 after the registered claims")
-    test.assert_eq_str(hex(cosecwt.claims_to_bytes(cwtcnf.with_cnf(blank(), CnfKid(h("6b31"))))),
+    test.assert_eq_str(hex(cwtclaim.claims_to_bytes(cwtcnf.with_cnf(blank(), CnfKid(h("6b31"))))),
                        "a108a103426b31")
     test.case("a second confirmation replaces the first")
     let again = cwtcnf.with_cnf(bound, CnfKid(h("6b32")))

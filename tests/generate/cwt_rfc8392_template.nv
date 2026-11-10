@@ -21,7 +21,6 @@
 
 use std.test
 use std.bytes
-use cborfmt
 use coseerr
 use cosekey
 use cosealg

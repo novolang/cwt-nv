@@ -1,0 +1,207 @@
+// cwt_open_tests.nv — a token's kind from its tags, opening it, and issuing
+// the three kinds.
+//
+// RFC 8392 section 6 puts the CWT tag, 61, outside the COSE tag, 18, 17 or
+// 16, and RFC 9052 section 2 lets the COSE tag be left off when the kind is
+// known another way.  The byte strings that stand for those cases are made
+// by hand:
+//   d8 3d d1 80   tag 61, tag 17, an empty array
+//   d2 80         tag 18, an empty array
+//   d8 3d d8 3d   tag 61 twice
+//   d8 63 80      tag 99, an empty array
+//   80            an untagged empty array
+
+use std.test
+use std.bytes
+use std.str
+use coseerr
+use cosekey
+use cosehdr
+use cosealg
+use cosemsg
+use cose
+use cosecwt
+use cwt
+use cwtcheck
+use cwtcnf
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn none() -> Bytes
+    bytes.zeros(0)
+
+fn said(r: Result<CwtClaims, CoseError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+fn secret(n: Int) -> CoseKey
+    var k = bytes.zeros(n)
+    for i in 0..n
+        bytes.set_u8(k, i, i * 5 + 1)
+    cosekey.symmetric(k)
+
+fn ed_key() -> CoseKey
+    cosekey.ed25519(h("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+                    Some(h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")))
+
+fn claims() -> CwtClaims
+    CwtClaims { iss: Some("issuer"), sub: Some("subject"), aud: Some("audience"), exp: Some(2000), nbf: Some(1000),
+                iat: Some(900), cti: Some(h("0b71")), extra: [] }
+
+fn at(now: Int) -> CwtRules
+    cwtcheck.rules_at(now)
+
+fn iv12() -> Bytes
+    h("000102030405060708090a0b")
+
+@test
+fn test_the_cwt_tag_is_told_from_the_cose_tag() [io]
+    test.case("tag 61 is the CWT tag")
+    test.assert_eq(cwt.is_tagged(h("d83dd180")), Ok(true))
+    test.case("tag 18 alone is not")
+    test.assert_eq(cwt.is_tagged(h("d280")), Ok(false))
+    test.case("an array with no tag is not")
+    test.assert_eq(cwt.is_tagged(h("80")), Ok(false))
+    test.case("bytes that are not CBOR are refused")
+    test.assert_eq(cwt.is_tagged(h("ff")) == Ok(false), false)
+
+@test
+fn test_the_kind_comes_from_the_cose_tag_under_the_cwt_tag_or_not() [io]
+    test.case("17 under 61 is a MACed token")
+    test.assert_eq(cwt.kind_of(h("d83dd180")), Ok(Some(CwtMaced)))
+    test.case("18 alone is a signed token")
+    test.assert_eq(cwt.kind_of(h("d280")), Ok(Some(CwtSigned)))
+    test.case("16 alone is an encrypted token")
+    test.assert_eq(cwt.kind_of(h("d080")), Ok(Some(CwtEncrypted)))
+    test.case("no COSE tag leaves the kind to the caller")
+    test.assert_eq(cwt.kind_of(h("80")), Ok(None))
+    test.assert_eq(cwt.kind_of(h("d83d80")), Ok(None))
+    test.case("a tag that is not one of the three is refused")
+    test.assert_eq(cwt.kind_of(h("d86380")) == Ok(None), false)
+    test.assert_eq_str(said_kind(cwt.kind_of(h("d86380"))), "cose: tag 99 where tag 18 was expected")
+    test.case("a second CWT tag is not a COSE tag")
+    test.assert_eq_str(said_kind(cwt.kind_of(h("d83dd83d80"))), "cose: tag 61 where tag 18 was expected")
+    test.case("bytes that are not CBOR")
+    test.assert_eq_str(first_word(said_kind(cwt.kind_of(h("ff")))), "cose:")
+
+fn said_kind(r: Result<?CwtKind, CoseError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+fn first_word(s: Str) -> Str
+    str.slice(s, 0, 5)
+
+@test
+fn test_a_token_with_no_cose_tag_must_be_opened_with_its_kind_named() [io]
+    let key = secret(32)
+    test.case("open refuses it and says so")
+    test.assert_eq_str(said(cwt.open(h("80"), CoseHmac256, key, none(), at(1500))),
+                       "cose: malformed structure: cwt: the message has no COSE tag; name its kind with open_as")
+    test.case("a token with its tags taken off is opened as the kind the caller names")
+    match cosecwt.mac0(CoseHmac256, key, cosehdr.empty(), cosehdr.empty(), claims(), none(), false)
+        Err(_)     => test.fail("mac0 refused")
+        Ok(tagged) =>
+            match cosecwt_untagged(tagged)
+                Err(_)   => test.fail("the token did not strip")
+                Ok(bare) =>
+                    test.assert_eq_str(said(cwt.open_as(CwtMaced, bare, CoseHmac256, key, none(), at(1500))), "ok")
+
+// The MACed token with its 17 tag removed, by taking the array's bytes.
+fn cosecwt_untagged(tagged: Bytes) -> Result<Bytes, CoseError>
+    // d1 is the one-byte head of tag 17; the array follows.
+    if bytes.len(tagged) > 1 and bytes.byte_at(tagged, 0) == Some(0xd1)
+        Ok(bytes.slice(tagged, 1, bytes.len(tagged)))
+    else
+        Err(CoseBadStructure("the token does not begin with tag 17"))
+
+@test
+fn test_a_signed_token_is_issued_opened_and_refused_for_a_wrong_key() [io]
+    let public = cosekey.public_part(ed_key())
+    test.case("issued with a kid and the CWT tag, opened by its tags")
+    match cwt.issue_signed(CoseEdDSA, ed_key(), Some(h("6b31")), claims(), none(), true)
+        Err(_)    => test.fail("issue_signed refused")
+        Ok(token) =>
+            test.assert_eq(cwt.is_tagged(token), Ok(true))
+            test.assert_eq(cwt.kind_of(token), Ok(Some(CwtSigned)))
+            test.assert_eq_str(said(cwt.open(token, CoseEdDSA, public, none(), at(1500))), "ok")
+            test.case("the external data must be the same on both sides")
+            test.assert_eq_str(said(cwt.open(token, CoseEdDSA, public, h("01"), at(1500))),
+                               "cose: the signature or tag did not verify")
+            test.case("the claims are judged only after the signature")
+            test.assert_eq_str(said(cwt.open(token, CoseEdDSA, public, none(), at(5000))),
+                "cwt: expired at 2000, now 5000")
+    test.case("issued with no kid and no CWT tag")
+    match cwt.issue_signed(CoseEdDSA, ed_key(), None, claims(), none(), false)
+        Err(_)    => test.fail("issue_signed refused")
+        Ok(token) =>
+            test.assert_eq(cwt.is_tagged(token), Ok(false))
+            test.assert_eq_str(said(cwt.open(token, CoseEdDSA, public, none(), at(1500))), "ok")
+    test.case("a signature under another key does not verify")
+    match cwt.issue_signed(CoseEdDSA, ed_key(), None, claims(), none(), false)
+        Err(_)    => test.fail("issue_signed refused")
+        Ok(token) =>
+            let stranger = cosekey.ed25519(h("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"), None)
+            test.assert_eq_str(said(cwt.open(token, CoseEdDSA, stranger, none(), at(1500))),
+                               "cose: the signature or tag did not verify")
+
+@test
+fn test_a_maced_token_is_issued_and_opened() [io]
+    let key = secret(32)
+    test.case("issued with the CWT tag and a kid")
+    match cwt.issue_maced(CoseHmac256, key, Some(h("6b31")), claims(), none(), true)
+        Err(_)    => test.fail("issue_maced refused")
+        Ok(token) =>
+            test.assert_eq(cwt.kind_of(token), Ok(Some(CwtMaced)))
+            test.assert_eq_str(said(cwt.open(token, CoseHmac256, key, none(), at(1500))), "ok")
+            test.case("not yet valid before nbf")
+            test.assert_eq_str(said(cwt.open(token, CoseHmac256, key, none(), at(10))),
+                "cwt: not valid before 1000, now 10")
+            test.case("another key")
+            test.assert_eq_str(said(cwt.open(token, CoseHmac256, secret(16), none(), at(1500))),
+                               "cose: the signature or tag did not verify")
+    test.case("issued with no kid")
+    match cwt.issue_maced(CoseHmac256, key, None, claims(), none(), false)
+        Err(_)    => test.fail("issue_maced refused")
+        Ok(token) => test.assert_eq_str(said(cwt.open(token, CoseHmac256, key, none(), at(1500))), "ok")
+
+@test
+fn test_an_encrypted_token_is_issued_and_opened_under_both_aeads() [io]
+    test.case("AES-128-GCM with a kid")
+    match cwt.issue_encrypted(CoseA128Gcm, secret(16), iv12(), Some(h("6b31")), claims(), none(), true)
+        Err(_)    => test.fail("issue_encrypted refused")
+        Ok(token) =>
+            test.assert_eq(cwt.kind_of(token), Ok(Some(CwtEncrypted)))
+            test.assert_eq_str(said(cwt.open(token, CoseA128Gcm, secret(16), none(), at(1500))), "ok")
+            test.assert_eq_str(said(cwt.open(token, CoseA128Gcm, secret(16), h("00"), at(1500))),
+                               "cose: the signature or tag did not verify")
+    test.case("ChaCha20/Poly1305 with no kid, with the confirmation claim kept through the trip")
+    let bound = cwtcnf.with_cnf(claims(), CnfKid(h("6b31")))
+    match cwt.issue_encrypted(CoseChaCha20Poly1305, secret(32), iv12(), None, bound, none(), false)
+        Err(_)    => test.fail("issue_encrypted refused")
+        Ok(token) =>
+            match cwt.open(token, CoseChaCha20Poly1305, secret(32), none(), at(1500))
+                Err(_) => test.fail("open refused")
+                Ok(c)  => test.assert_eq(cwtcnf.cnf_of(c), Ok(Some(CnfKid(h("6b31")))))
+    test.case("an IV of the wrong length is the COSE layer's refusal")
+    match cwt.issue_encrypted(CoseA128Gcm, secret(16), h("00"), None, claims(), none(), false)
+        Err(e) => test.assert_eq_str(e.message(), "cose: the initialization vector is 1 bytes, the algorithm needs 12")
+        Ok(_)  => test.fail("a one-byte IV was accepted")
+
+@test
+fn test_a_message_that_is_not_a_cwt_is_refused_after_it_verifies() [io]
+    let key = secret(32)
+    test.case("a MAC over a payload that is the integer 1")
+    match cose.mac0(CoseHmac256, key, cosehdr.empty(), cosehdr.empty(), h("01"), none(), false)
+        Err(_) => test.fail("mac0 refused")
+        Ok(m)  =>
+            let token = cosemsg.mac0_to_bytes(m, true)
+            test.assert_eq_str(said(cwt.open(token, CoseHmac256, key, none(), at(1500))), "cwt: claim 0 is malformed")
+    test.case("a MAC over bytes that are not CBOR")
+    match cose.mac0(CoseHmac256, key, cosehdr.empty(), cosehdr.empty(), h("ff"), none(), false)
+        Err(_) => test.fail("mac0 refused")
+        Ok(m)  =>
+            let token = cosemsg.mac0_to_bytes(m, true)
+            test.assert_eq(said(cwt.open(token, CoseHmac256, key, none(), at(1500))) == "ok", false)

@@ -1,0 +1,306 @@
+// cwtdev.nv — a CBOR Web Token on a device with no heap allocator.
+//
+// A door controller that is handed a token reads a few hundred bytes and
+// decides.  This module reads the claims of a CWT in a fixed buffer and
+// answers what the decision needs: the issuer, subject, audience and token
+// identifier as places in the buffer, the three times as integers, the
+// confirmation claim and the key identifier inside it, and a count of the
+// claims in the private-use range.  It checks the times against a clock the
+// caller read, and compares a text claim with the bytes the device expects.
+//
+// Every function is `@tier(embedded)` and `@no_alloc`.  A buffer is a
+// `Vec[u8; COSE_DEV_MAX]`, 512 bytes, the buffer type of `cose-nv`'s
+// `cosedev`, which finds the parts of the COSE message that wraps the claims
+// and builds the string a signature or a tag covers.  A part of a message is
+// a `Region`, an offset and a length into the buffer it was found in, so
+// nothing is copied.  A `Region` with `len` -1 is a claim that is absent.
+//
+// The signature, the MAC and the AEAD are the device's own, as in
+// `cosedev`.  What this module adds to `cosedev` is the CWT tag, which
+// `unwrap` removes, and the whole claims set, where `cosedev.cwt_times`
+// reads two of its claims.
+//
+// A time is read as an integer.  A float, and an integer under tag 1, make
+// `ok` false: a device with no floating point unit is not asked to read one.
+// This module reads definite-length CBOR only.
+
+use cosedev
+
+// The `check` answer for a token that passes.
+pub const CWT_DEV_VALID = 0
+// The `check` answer for an expired token.
+pub const CWT_DEV_EXPIRED = 1
+// The `check` answer for a token that is not yet valid.
+pub const CWT_DEV_NOT_YET_VALID = 2
+// The `check` answer for a token with no expiration time.
+pub const CWT_DEV_NO_EXPIRY = 3
+// The `check` answer when the claims could not be read.
+pub const CWT_DEV_UNREADABLE = 4
+
+// The CWT tag, 61.
+pub const CWT_DEV_TAG = 61
+// The key of the `cnf` claim, 8.
+pub const CWT_DEV_CNF = 8
+// The key of the key identifier inside a `cnf` claim, 3.
+pub const CWT_DEV_CNF_KID = 3
+
+// The claims found in a buffer.
+//
+// `ok` is false when the claims are not a well-formed map, when a
+// registered claim has the wrong type or appears twice, or when a time is
+// not an integer; nothing else means anything then.  `iss`, `sub` and `aud`
+// are the text of the claim and `cti` the bytes, each `len` -1 when absent.
+// `cnf` is the whole map of the confirmation claim, and `cnf_kid` the bytes
+// of the key identifier inside it.  `private_claims` counts the claims whose
+// integer key is below -65536.
+pub @value
+struct CwtDevClaims
+    ok: Bool
+    iss: Region
+    sub: Region
+    aud: Region
+    cti: Region
+    cnf: Region
+    cnf_kid: Region
+    has_exp: Bool
+    exp: Int
+    has_nbf: Bool
+    nbf: Int
+    has_iat: Bool
+    iat: Int
+    private_claims: Int
+
+// The region of an absent claim.
+@tier(embedded)
+@no_alloc
+fn absent() -> Region
+    Region { at: 0, len: -1 }
+
+// The claims of a fault.
+@tier(embedded)
+@no_alloc
+fn unreadable() -> CwtDevClaims
+    CwtDevClaims { ok: false, iss: absent(), sub: absent(), aud: absent(), cti: absent(), cnf: absent(),
+                   cnf_kid: absent(), has_exp: false, exp: 0, has_nbf: false, nbf: 0, has_iat: false, iat: 0,
+                   private_claims: 0 }
+
+// The claims of a map being read: well-formed until a claim says otherwise.
+@tier(embedded)
+@no_alloc
+fn fresh() -> CwtDevClaims
+    CwtDevClaims { ok: true, iss: absent(), sub: absent(), aud: absent(), cti: absent(), cnf: absent(),
+                   cnf_kid: absent(), has_exp: false, exp: 0, has_nbf: false, nbf: 0, has_iat: false, iat: 0,
+                   private_claims: 0 }
+
+// The content of the string of major type `major` at `at`, or `len` -2.
+@tier(embedded)
+@no_alloc
+fn string_at(var m: Vec[u8; COSE_DEV_MAX], at: Int, end: Int, major: Int) -> Region
+    let h: DevHead = cosedev.read_head(var m, at, end)
+    if h.ok and h.major == major and h.arg <= end - h.next
+        Region { at: h.next, len: h.arg }
+    else
+        Region { at: 0, len: -2 }
+
+// A claim's text or bytes into its region, and false when the claim is
+// the wrong type or was already seen.
+@tier(embedded)
+@no_alloc
+fn text_claim(var m: Vec[u8; COSE_DEV_MAX], at: Int, end: Int, major: Int, seen: Region) -> Region
+    if seen.len != -1
+        return Region { at: 0, len: -2 }
+    string_at(var m, at, end, major)
+
+// Remove the CWT tag from the message in `src`, writing the message to
+// `dst`, and answer its length.
+//
+// A message with no tag 61 is copied as it is.  The copy is what `cosedev`
+// reads, because it reads a COSE message from offset 0 and a buffer cannot
+// be shifted in place.  -1 for a buffer that does not start with a tag or a
+// message, and for a length past the buffer.
+//
+// ```novo
+// use cosedev
+// use cwtdev
+//
+// fn main() [io]
+//     var src: Vec[u8; 512] = Vec.new()
+//     for b in [0xd8, 0x3d, 0xd1, 0x84]
+//         let _p = src.push(b as u8)
+//     var dst: Vec[u8; 512] = Vec.new()
+//     println("${cwtdev.unwrap(var src, 4, var dst)}")   // 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn unwrap(var src: Vec[u8; COSE_DEV_MAX], size: Int, var dst: Vec[u8; COSE_DEV_MAX]) -> Int []
+    if size < 0 or size > src.len()
+        return -1
+    dst.clear()
+    var from = 0
+    let first: DevHead = cosedev.read_head(var src, 0, size)
+    if first.ok and first.major == 6 and first.arg == CWT_DEV_TAG
+        from = first.next
+    for i in from..size
+        match dst.push(src[i])
+            Ok(_)  => 0
+            // cov: skip — dst was cleared above and has the capacity of src, which holds at most that many bytes, so a push cannot find it full
+            Err(_) =>
+                return -1
+    size - from
+
+// Whether the buffer starts with the CWT tag.
+pub @tier(embedded)
+@no_alloc
+fn is_tagged(var m: Vec[u8; COSE_DEV_MAX], size: Int) -> Bool []
+    let first: DevHead = cosedev.read_head(var m, 0, size)
+    first.ok and first.major == 6 and first.arg == CWT_DEV_TAG
+
+// The key identifier inside a `cnf` map, the member 3 as a byte string.
+@tier(embedded)
+@no_alloc
+fn cnf_kid_of(var m: Vec[u8; COSE_DEV_MAX], cnf: Region) -> Region
+    if cnf.len < 0
+        return absent()
+    let at = cosedev.find_label(var m, cnf.at, cnf.at + cnf.len, CWT_DEV_CNF_KID)
+    if at < 0
+        return absent()
+    let r: Region = string_at(var m, at, cnf.at + cnf.len, 2)
+    if r.len < 0
+        return absent()
+    r
+
+// Read the claims of the CWT whose claims set is in `payload`, found in
+// `m` by `cosedev`.
+//
+// The registered claims are read by their types: 1, 2 and 3 are text, 7 is
+// bytes, 4, 5 and 6 are integers, and 8 is a map.  A registered claim of
+// another type, or one that appears twice, gives `ok` false, and so does a
+// map that does not end where the region ends.  A claim under
+// another key is skipped, and counted when its key is in the private-use
+// range.
+//
+// ```novo
+// use cosedev
+// use cwtdev
+//
+// fn main() [io]
+//     // {1: "a", 4: 100}
+//     var m: Vec[u8; 512] = Vec.new()
+//     for b in [0xa2, 0x01, 0x61, 0x61, 0x04, 0x18, 0x64]
+//         let _p = m.push(b as u8)
+//     let c: CwtDevClaims = cwtdev.scan(var m, Region { at: 0, len: 7 })
+//     println("${c.ok} ${c.iss.len} ${c.exp}")   // true 1 100
+// ```
+pub @tier(embedded)
+@no_alloc
+fn scan(var m: Vec[u8; COSE_DEV_MAX], payload: Region) -> CwtDevClaims []
+    let end = payload.at + payload.len
+    let top: DevHead = cosedev.read_head(var m, payload.at, end)
+    if payload.len <= 0 or not top.ok or top.major != 5
+        return unreadable()
+    var c: CwtDevClaims = fresh()
+    var i = top.next
+    for _p in 0..top.arg
+        if c.ok
+            let k: DevHead = cosedev.read_head(var m, i, end)
+            let after = cosedev.skip_item(var m, i, end)
+            if not k.ok or after < 0
+                c = unreadable()
+            else
+                var label = 0
+                var integer = false
+                if k.major == 0
+                    label = k.arg
+                    integer = true
+                else if k.major == 1
+                    label = -1 - k.arg
+                    integer = true
+                if integer
+                    read_claim(var m, var c, label, after, end)
+                let next = cosedev.skip_item(var m, after, end)
+                if next < 0
+                    c = unreadable()
+                i = next
+    if i != end
+        c = unreadable()
+    finish(var m, var c)
+    c
+
+// Take the claim `label` whose value starts at `at` into `c`.
+@tier(embedded)
+@no_alloc
+fn read_claim(var m: Vec[u8; COSE_DEV_MAX], var c: CwtDevClaims, label: Int, at: Int, end: Int)
+    if label == 1
+        c.iss = text_claim(var m, at, end, 3, c.iss)
+        c.ok = c.iss.len >= 0
+    else if label == 2
+        c.sub = text_claim(var m, at, end, 3, c.sub)
+        c.ok = c.sub.len >= 0
+    else if label == 3
+        c.aud = text_claim(var m, at, end, 3, c.aud)
+        c.ok = c.aud.len >= 0
+    else if label == 7
+        c.cti = text_claim(var m, at, end, 2, c.cti)
+        c.ok = c.cti.len >= 0
+    else if label == 4
+        let t: DevInt = cosedev.int_at(var m, at, end)
+        c.ok = t.ok and not c.has_exp
+        c.has_exp = true
+        c.exp = t.value
+    else if label == 5
+        let t: DevInt = cosedev.int_at(var m, at, end)
+        c.ok = t.ok and not c.has_nbf
+        c.has_nbf = true
+        c.nbf = t.value
+    else if label == 6
+        let t: DevInt = cosedev.int_at(var m, at, end)
+        c.ok = t.ok and not c.has_iat
+        c.has_iat = true
+        c.iat = t.value
+    else if label == CWT_DEV_CNF
+        let h: DevHead = cosedev.read_head(var m, at, end)
+        let after = cosedev.skip_item(var m, at, end)
+        c.ok = h.ok and h.major == 5 and after > 0 and c.cnf.len == -1
+        c.cnf = Region { at: at, len: after - at }
+    else if label < -65536
+        c.private_claims = c.private_claims + 1
+
+// Find the key identifier inside the `cnf` claim, once the claims are read.
+@tier(embedded)
+@no_alloc
+fn finish(var m: Vec[u8; COSE_DEV_MAX], var c: CwtDevClaims)
+    if c.ok
+        c.cnf_kid = cnf_kid_of(var m, c.cnf)
+
+// Check the times of the claims at `now`, in seconds, with `leeway`
+// seconds of tolerance.
+//
+// `CWT_DEV_VALID`, or `CWT_DEV_EXPIRED` when `now` is at or past
+// `exp + leeway`, `CWT_DEV_NOT_YET_VALID` when `now` is before
+// `nbf - leeway`, `CWT_DEV_NO_EXPIRY` for a token with no expiration time
+// and `CWT_DEV_UNREADABLE` when the claims could not be read.  The rules are
+// those of `cwtcheck.check`.
+pub @tier(embedded)
+@no_alloc
+fn check(c: CwtDevClaims, now: Int, leeway: Int) -> Int []
+    if not c.ok
+        CWT_DEV_UNREADABLE
+    else if not c.has_exp
+        CWT_DEV_NO_EXPIRY
+    else if now >= c.exp + leeway
+        CWT_DEV_EXPIRED
+    else if c.has_nbf and now < c.nbf - leeway
+        CWT_DEV_NOT_YET_VALID
+    else
+        CWT_DEV_VALID
+
+// Whether the bytes of `r` in `m` are the `want.len` bytes at `want.at` in
+// `other`.  False for a region that is absent or does not fit its buffer.
+//
+// The comparison looks at every byte whatever the first difference, so the
+// time it takes does not say where two audiences part.
+pub @tier(embedded)
+@no_alloc
+fn region_is(var m: Vec[u8; COSE_DEV_MAX], r: Region, var other: Vec[u8; COSE_DEV_MAX],
+             want: Region) -> Bool []
+    r.len >= 0 and want.len == r.len and cosedev.ct_eq(var m, r.at, var other, want.at, r.len)

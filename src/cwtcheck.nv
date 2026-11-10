@@ -1,0 +1,126 @@
+// cwtcheck.nv — whether a claims set is acceptable now, to this recipient.
+//
+// A signature says who made a token.  It says nothing about whether the
+// token is still good, or whether it was meant for the party that holds it.
+// Those are the claims' work, and RFC 8392 section 3 says what each means:
+// the token is not to be accepted on or after its expiration time, nor
+// before its not-before time, and a recipient that is not among the
+// audience is to reject it.
+//
+// This package has no clock.  The time is a number of seconds the caller
+// read, in `CwtRules`, so the same token checks the same way in a test, in
+// a replay and on a device with no real-time clock.  `leeway` seconds
+// absorb the difference between two clocks, in either direction.
+
+use std.list
+use coseerr
+use cosecwt
+
+// What a check requires.
+//
+// `now` is the current time in seconds since the epoch and `leeway` the
+// seconds of clock difference to tolerate.  `issuers` lists the issuers the
+// recipient trusts: empty means any, otherwise the token's `iss` has to be
+// one of them.  `audience` is the identifier the recipient answers to: when
+// present, the token's `aud` has to equal it.  `require_exp` and
+// `require_nbf` refuse a token that lacks the time claim.
+pub struct CwtRules
+    now: Int
+    leeway: Int
+    issuers: [Str]
+    audience: ?Str
+    require_exp: Bool
+    require_nbf: Bool
+
+// The rules at `now`: no leeway, any issuer, no audience, an expiration time
+// required.
+//
+// ```novo
+// use cwtcheck
+//
+// fn main() [io]
+//     let r = cwtcheck.rules_at(1444064944)
+//     println("${r.leeway} ${r.require_exp} ${r.require_nbf}")   // 0 true false
+// ```
+pub fn rules_at(now: Int) -> CwtRules []
+    CwtRules { now: now,
+        leeway: 0,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false }
+
+// Check a claims set against the rules.
+//
+// The checks run in this order: issuer, audience, expiration time,
+// not-before time.  A token is expired when `now` is at or past
+// `exp + leeway` (RFC 8392 section 3.1.4: the current time has to be before
+// the expiration time) and not yet valid when `now` is before `nbf - leeway`
+// (section 3.1.5).  The issued-at time is not checked: a recipient that
+// wants a maximum age compares it itself.
+//
+// Refuses `CwtIssuerMismatch`, `CwtAudienceMismatch`, `CwtMissingClaim(4)`
+// and `CwtMissingClaim(5)` for a required time that is absent,
+// `CwtExpired` and `CwtNotYetValid`.
+//
+// ```novo
+// use cosecwt
+// use cwtcheck
+//
+// fn main() [io]
+//     let c = CwtClaims { iss: None, sub: None, aud: None, exp: Some(100), nbf: None, iat: None, cti: None, extra: [] }
+//     match cwtcheck.check(c, cwtcheck.rules_at(100))
+//         Ok(_)  => println("valid")
+//         Err(e) => println(e.message())   // cwt: expired at 100, now 100
+// ```
+pub fn check(c: CwtClaims, r: CwtRules) -> Result<Unit, CoseError> []
+    check_issuer(c.iss, r.issuers)!
+    check_audience(c.aud, r.audience)!
+    check_expiry(c.exp, r)!
+    check_not_before(c.nbf, r)
+
+fn check_issuer(iss: ?Str, trusted: [Str]) -> Result<Unit, CoseError>
+    if list.len(trusted) == 0
+        return Ok(())
+    match iss
+        None    => Err(CwtIssuerMismatch)
+        Some(i) =>
+            if list.contains(trusted, i)
+                Ok(())
+            else
+                Err(CwtIssuerMismatch)
+
+fn check_audience(aud: ?Str, want: ?Str) -> Result<Unit, CoseError>
+    match want
+        None    => Ok(())
+        Some(w) =>
+            if aud == Some(w)
+                Ok(())
+            else
+                Err(CwtAudienceMismatch)
+
+fn check_expiry(exp: ?Int, r: CwtRules) -> Result<Unit, CoseError>
+    match exp
+        None    =>
+            if r.require_exp
+                Err(CwtMissingClaim(cosecwt.CWT_EXP))
+            else
+                Ok(())
+        Some(e) =>
+            if r.now >= e + r.leeway
+                Err(CwtExpired(e, r.now))
+            else
+                Ok(())
+
+fn check_not_before(nbf: ?Int, r: CwtRules) -> Result<Unit, CoseError>
+    match nbf
+        None    =>
+            if r.require_nbf
+                Err(CwtMissingClaim(cosecwt.CWT_NBF))
+            else
+                Ok(())
+        Some(n) =>
+            if r.now < n - r.leeway
+                Err(CwtNotYetValid(n, r.now))
+            else
+                Ok(())

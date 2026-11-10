@@ -1,0 +1,20 @@
+[package]
+name        = "cwt-nv"
+version     = "0.1.0"
+description = "CBOR Web Token, RFC 8392, over cose-nv and cbor-nv: the claims with their registered keys and the private-use range, the proof-of-possession claim of RFC 8747, the CWT tag 61 around a COSE_Sign1, COSE_Mac0 or COSE_Encrypt0, validation of the time claims and the audience against a clock the caller passes, and a reader for a device with no heap that finds the claims of a token in a fixed buffer."
+license     = "Apache-2.0"
+stability   = "experimental"
+layer       = "core"
+host_modules = ["cwtclaim", "cwtcnf", "cwtcheck", "cwt"]
+category    = "crypto"
+tags        = ["cwt", "cbor", "rfc-8392", "rfc-8747", "rfc-9200", "token", "claims", "cose", "iot", "embedded"]
+repository  = "https://github.com/novolang/cwt-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.23.0"
+
+[docs.pages]
+"README.md" = "CBOR Web Tokens: claims, proof of possession and validation"
+
+[dependencies]
+cbor-nv = "^0.1.0"
+cose-nv = { path = "../cose-nv" }

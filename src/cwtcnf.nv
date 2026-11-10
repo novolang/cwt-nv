@@ -1,0 +1,157 @@
+// cwtcnf.nv — the confirmation claim `cnf`, RFC 8747.
+//
+// A bearer token is good for whoever holds it.  A token with a `cnf`
+// claim names a key, and the party that presents the token has to show it
+// holds that key too: the token is bound to the key, and stealing the
+// token is no longer enough (RFC 8747 section 1).  The key is the proof
+// of possession key, and RFC 9200 (OAuth 2.0 for constrained devices)
+// uses the claim to bind an access token to the client's key.
+//
+// The claim's value is a CBOR map that holds one confirmation method:
+//
+//   1  COSE_Key          the key itself, so any holder of the token can
+//                        read it
+//   2  Encrypted_COSE_Key  a COSE_Encrypt0 or COSE_Encrypt that holds the
+//                        key, for a token that travels in the clear
+//   3  kid               the identifier of a key the recipient already has
+//
+// This module writes and reads that map.  Showing possession, with a
+// signature or a MAC under the key, is the protocol's.
+
+use std.bytes
+use std.list
+use cborfmt
+use coseerr
+use cosecbor
+use cosekey
+use cosecwt
+use cwtclaim
+
+// The confirmation method that carries a COSE_Key.
+pub const CNF_COSE_KEY = 1
+// The confirmation method that carries an encrypted COSE_Key.
+pub const CNF_ENCRYPTED_KEY = 2
+// The confirmation method that carries a key identifier.
+pub const CNF_KID = 3
+
+// A confirmation method and what it carries.
+pub enum Cnf
+    // Method 1: the key.
+    CnfKey(key: CoseKey)
+    // Method 2: a COSE_Encrypt0 or COSE_Encrypt as a CBOR value.  Opening
+    // it is the recipient's, with a key the token does not carry.
+    CnfEncrypted(message: CborValue)
+    // Method 3: the identifier of a key.
+    CnfKid(kid: Bytes)
+
+// The method number of a confirmation.
+pub fn method_of(c: Cnf) -> Int []
+    match c
+        CnfKey(_)       => CNF_COSE_KEY
+        CnfEncrypted(_) => CNF_ENCRYPTED_KEY
+        CnfKid(_)       => CNF_KID
+
+// A confirmation as the CBOR map of RFC 8747 section 3.1.
+//
+// ```novo
+// use std.bytes
+// use cwtcnf
+//
+// fn main() [io]
+//     let wire = cwtcnf.to_bytes(CnfKid(bytes.from_str("k1")))
+//     println(bytes.to_hex(wire))   // a103426b31
+// ```
+pub fn to_value(c: Cnf) -> CborValue []
+    match c
+        CnfKey(k)       => one(CNF_COSE_KEY, cosekey.key_to_value(k))
+        CnfEncrypted(m) => one(CNF_ENCRYPTED_KEY, m)
+        CnfKid(kid)     => one(CNF_KID, CborBytes(kid))
+
+fn one(method: Int, v: CborValue) -> CborValue
+    CborMap([CborPair { key: cosecbor.int_value(method), value: v }])
+
+// A confirmation in its deterministic encoding.
+pub fn to_bytes(c: Cnf) -> Bytes []
+    cosecbor.encode_value(to_value(c))
+
+// A confirmation read from the value of a `cnf` claim.
+//
+// Refuses `CwtBadClaim(8)` for a value that is not a map of exactly one
+// member, a method this package does not know, and a member of the wrong
+// type for its method.  A COSE_Key that cannot be read gives
+// `key_from_value`'s refusal.
+pub fn from_value(v: CborValue) -> Result<Cnf, CoseError> []
+    match v
+        CborMap(entries) =>
+            if list.len(entries) != 1
+                return Err(CwtBadClaim(cwtclaim.CWT_CNF))
+            let p = entries[0]
+            match cosecbor.int_of(p.key)
+                Some(1) =>
+                    let k = cosekey.key_from_value(p.value)!
+                    Ok(CnfKey(k))
+                Some(2) => encrypted_of(p.value)
+                Some(3) => kid_of(p.value)
+                _       => Err(CwtBadClaim(cwtclaim.CWT_CNF))
+        _                => Err(CwtBadClaim(cwtclaim.CWT_CNF))
+
+fn encrypted_of(v: CborValue) -> Result<Cnf, CoseError>
+    match v
+        CborArray(_)     => Ok(CnfEncrypted(v))
+        CborTagged(_, _) => Ok(CnfEncrypted(v))
+        _                => Err(CwtBadClaim(cwtclaim.CWT_CNF))
+
+fn kid_of(v: CborValue) -> Result<Cnf, CoseError>
+    match cosecbor.bytes_of(v)
+        Some(b) => Ok(CnfKid(bytes.clone(b)))
+        None    => Err(CwtBadClaim(cwtclaim.CWT_CNF))
+
+// A confirmation read from its encoding.
+pub fn from_bytes(src: Bytes) -> Result<Cnf, CoseError> []
+    let v = cosecbor.decode_value(src)!
+    from_value(v)
+
+// A claims set with its `cnf` claim set to `c`, replacing any it held.
+//
+// ```novo
+// use std.bytes
+// use cosecwt
+// use cwtcnf
+//
+// fn main() [io]
+//     let set = cwtcnf.with_cnf(cosecwt.claims_empty(), CnfKid(bytes.from_str("k1")))
+//     match cwtcnf.cnf_of(set)
+//         Ok(Some(_)) => println("bound")
+//         _           => println("unbound")
+// ```
+pub fn with_cnf(c: CwtClaims, cnf: Cnf) -> CwtClaims []
+    let cleared = cwtclaim.without_claim(c, cwtclaim.CWT_CNF)
+    var extra = cleared.extra[:]
+    list.push(extra, CborPair { key: cosecbor.int_value(cwtclaim.CWT_CNF), value: to_value(cnf) })
+    CwtClaims { iss: cleared.iss, sub: cleared.sub, aud: cleared.aud, exp: cleared.exp, nbf: cleared.nbf,
+                iat: cleared.iat, cti: cleared.cti, extra: extra }
+
+// The confirmation a claims set carries, or nothing when it has no `cnf`.
+//
+// Refuses what `from_value` refuses.
+pub fn cnf_of(c: CwtClaims) -> Result<?Cnf, CoseError> []
+    match cwtclaim.claim_of(c, cwtclaim.CWT_CNF)
+        None    => Ok(None)
+        Some(v) =>
+            let cnf = from_value(v)!
+            Ok(Some(cnf))
+
+// The key a confirmation carries when it carries one in the clear.
+pub fn key_of(c: Cnf) -> ?CoseKey []
+    match c
+        CnfKey(k) => Some(k)
+        _         => None
+
+// Whether a confirmation names the key identified by `kid`: a `kid`
+// method with that identifier, or a COSE_Key whose `kid` member is it.
+// An encrypted key names nothing until it is opened.
+pub fn names_kid(c: Cnf, kid: Bytes) -> Bool []
+    match c
+        CnfKid(k) => k == kid
+        CnfKey(k) => k.kid == Some(kid)
+        _         => false

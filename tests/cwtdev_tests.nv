@@ -1,0 +1,222 @@
+// cwtdev_tests.nv — the claims of a CWT read in a fixed buffer.
+//
+// The claims sets are derived by hand from RFC 8392 section 3 and RFC 8747
+// section 3.1, byte by byte, and the offsets in the assertions follow from
+// the derivation.  The rich set is this map of ten pairs:
+//
+//   aa                         map of 10
+//   01 61 69                   1 (iss)  "i"
+//   02 62 73 75                2 (sub)  "su"
+//   03 63 61 75 64             3 (aud)  "aud"
+//   04 18 c8                   4 (exp)  200
+//   05 18 64                   5 (nbf)  100
+//   06 18 32                   6 (iat)  50
+//   07 42 0b 71                7 (cti)  h'0b71'
+//   08 a1 03 42 6b 31          8 (cnf)  {3: h'6b31'}
+//   3a 00 01 11 6f 61 78       -70000   "x"      (-1 - 69999, 69999 = 0x1116f)
+//   63 6b 65 79 01             "key"    1        (a text key, skipped)
+//
+// that is 44 bytes: the head at 0, `iss` content at 3, `sub` at 6, `aud` at
+// 10, `cti` at 24, the `cnf` map at 27 (5 bytes) and its kid at 30.
+
+use std.test
+use std.bytes
+use cosedev
+use cwtdev
+
+fn load(s: Str) -> Vec[u8; 512]
+    var m: Vec[u8; 512] = Vec.new()
+    let raw = bytes.from_hex(s) ?? bytes.zeros(0)
+    for i in 0..bytes.len(raw)
+        let _p = m.push((bytes.byte_at(raw, i) ?? 0) as u8)
+    m
+
+fn whole(var m: Vec[u8; 512]) -> Region
+    Region { at: 0, len: m.len() }
+
+fn rich() -> Str
+    "aa" + "016169" + "02627375" + "0363617564" + "0418c8" + "051864" + "061832" + "07420b71" + "08a103426b31" + "3a0001116f6178" + "636b657901"
+
+fn scan_hex(s: Str) -> CwtDevClaims
+    var m = load(s)
+    cwtdev.scan(var m, whole(var m))
+
+@test
+fn test_every_registered_claim_is_found_by_place_and_by_value() [io]
+    test.case("the ten-pair set")
+    let c = scan_hex(rich())
+    test.assert_eq(c.ok, true)
+    test.assert_eq(c.iss.at, 3)
+    test.assert_eq(c.iss.len, 1)
+    test.assert_eq(c.sub.at, 6)
+    test.assert_eq(c.sub.len, 2)
+    test.assert_eq(c.aud.at, 10)
+    test.assert_eq(c.aud.len, 3)
+    test.assert_eq(c.cti.at, 24)
+    test.assert_eq(c.cti.len, 2)
+    test.assert_eq(c.exp, 200)
+    test.assert_eq(c.nbf, 100)
+    test.assert_eq(c.iat, 50)
+    test.assert_eq(c.has_exp and c.has_nbf and c.has_iat, true)
+    test.case("the confirmation map, and the key identifier inside it")
+    test.assert_eq(c.cnf.at, 27)
+    test.assert_eq(c.cnf.len, 5)
+    test.assert_eq(c.cnf_kid.at, 30)
+    test.assert_eq(c.cnf_kid.len, 2)
+    test.case("one claim in the private-use range is counted, the text key is not")
+    test.assert_eq(c.private_claims, 1)
+
+@test
+fn test_the_claims_set_of_rfc_8392_a1_reads() [io]
+    // A.1, the claims of the example CWT.
+    let c = scan_hex("a70175636f61703a2f2f61732e6578616d706c652e636f6d02656572696b77037818636f61703a2f2f6c696768742e6578616d706c652e636f6d041a5612aeb0051a5610d9f0061a5610d9f007420b71")
+    test.assert_eq(c.ok, true)
+    test.assert_eq(c.iss.len, 21)
+    test.assert_eq(c.sub.len, 5)
+    test.assert_eq(c.aud.len, 24)
+    test.assert_eq(c.exp, 1444064944)
+    test.assert_eq(c.nbf, 1443944944)
+    test.assert_eq(c.iat, 1443944944)
+    test.assert_eq(c.cti.len, 2)
+    test.assert_eq(c.cnf.len, -1)
+    test.assert_eq(c.cnf_kid.len, -1)
+    test.assert_eq(c.private_claims, 0)
+
+@test
+fn test_a_claim_that_is_absent_is_a_region_of_length_minus_one() [io]
+    test.case("an empty map")
+    let c = scan_hex("a0")
+    test.assert_eq(c.ok, true)
+    test.assert_eq(c.iss.len, -1)
+    test.assert_eq(c.sub.len, -1)
+    test.assert_eq(c.aud.len, -1)
+    test.assert_eq(c.cti.len, -1)
+    test.assert_eq(c.has_exp, false)
+    test.case("a cnf with no key identifier")
+    let bare = scan_hex("a108a10141" + "00")
+    test.assert_eq(bare.ok, true)
+    test.assert_eq(bare.cnf.len, 4)
+    test.assert_eq(bare.cnf_kid.len, -1)
+    test.case("a cnf whose member 3 is not a byte string has no identifier")
+    let odd = scan_hex("a108a10301")
+    test.assert_eq(odd.ok, true)
+    test.assert_eq(odd.cnf_kid.len, -1)
+
+@test
+fn test_a_set_that_cannot_be_read_says_so_and_nothing_else() [io]
+    test.case("not a map")
+    test.assert_eq(scan_hex("80").ok, false)
+    test.case("an empty region")
+    var m = load("a0")
+    test.assert_eq(cwtdev.scan(var m, Region { at: 0, len: 0 }).ok, false)
+    test.case("a region past the bytes held")
+    test.assert_eq(cwtdev.scan(var m, Region { at: 0, len: 40 }).ok, false)
+    test.case("bytes after the map inside the region")
+    test.assert_eq(scan_hex("a0" + "00").ok, false)
+    test.case("a truncated map: two pairs promised, one present")
+    test.assert_eq(scan_hex("a2" + "016169").ok, false)
+    test.case("a value cut short: a text of 3 bytes with one")
+    test.assert_eq(scan_hex("a1" + "016361").ok, false)
+    test.case("a key cut short")
+    test.assert_eq(scan_hex("a1" + "18").ok, false)
+    test.case("a text claim that is an integer")
+    test.assert_eq(scan_hex("a1" + "0101").ok, false)
+    test.assert_eq(scan_hex("a1" + "0201").ok, false)
+    test.assert_eq(scan_hex("a1" + "0301").ok, false)
+    test.case("the token identifier as text")
+    test.assert_eq(scan_hex("a1" + "076161").ok, false)
+    test.case("a time as text")
+    test.assert_eq(scan_hex("a1" + "046161").ok, false)
+    test.assert_eq(scan_hex("a1" + "056161").ok, false)
+    test.assert_eq(scan_hex("a1" + "066161").ok, false)
+    test.case("a time as a float, and as an integer under tag 1")
+    test.assert_eq(scan_hex("a1" + "04fb4000000000000000").ok, false)
+    test.assert_eq(scan_hex("a1" + "04c101").ok, false)
+    test.case("a confirmation that is not a map")
+    test.assert_eq(scan_hex("a1" + "0801").ok, false)
+    test.case("a claim twice")
+    test.assert_eq(scan_hex("a2" + "016161" + "016162").ok, false)
+    test.assert_eq(scan_hex("a2" + "026161" + "026162").ok, false)
+    test.assert_eq(scan_hex("a2" + "03616103" + "6162").ok, false)
+    test.assert_eq(scan_hex("a2" + "0401" + "0402").ok, false)
+    test.assert_eq(scan_hex("a2" + "0501" + "0502").ok, false)
+    test.assert_eq(scan_hex("a2" + "0601" + "0602").ok, false)
+    test.assert_eq(scan_hex("a2" + "07410007" + "4100").ok, false)
+    test.assert_eq(scan_hex("a2" + "08a0" + "08a0").ok, false)
+    test.case("a map claimed by an indefinite length")
+    test.assert_eq(scan_hex("bf" + "016161" + "ff").ok, false)
+
+@test
+fn test_the_times_are_judged_the_way_cwtcheck_judges_them() [io]
+    let c = scan_hex("a2" + "0418c8" + "051864")
+    test.case("between nbf and exp")
+    test.assert_eq(cwtdev.check(c, 150, 0), cwtdev.CWT_DEV_VALID)
+    test.case("at exp it is expired, a second before it is valid")
+    test.assert_eq(cwtdev.check(c, 200, 0), cwtdev.CWT_DEV_EXPIRED)
+    test.assert_eq(cwtdev.check(c, 199, 0), cwtdev.CWT_DEV_VALID)
+    test.case("before nbf it is not yet valid, at nbf it is valid")
+    test.assert_eq(cwtdev.check(c, 99, 0), cwtdev.CWT_DEV_NOT_YET_VALID)
+    test.assert_eq(cwtdev.check(c, 100, 0), cwtdev.CWT_DEV_VALID)
+    test.case("leeway widens both edges")
+    test.assert_eq(cwtdev.check(c, 209, 10), cwtdev.CWT_DEV_VALID)
+    test.assert_eq(cwtdev.check(c, 210, 10), cwtdev.CWT_DEV_EXPIRED)
+    test.assert_eq(cwtdev.check(c, 90, 10), cwtdev.CWT_DEV_VALID)
+    test.assert_eq(cwtdev.check(c, 89, 10), cwtdev.CWT_DEV_NOT_YET_VALID)
+    test.case("no exp")
+    test.assert_eq(cwtdev.check(scan_hex("a0"), 5, 0), cwtdev.CWT_DEV_NO_EXPIRY)
+    test.case("unreadable claims")
+    test.assert_eq(cwtdev.check(scan_hex("80"), 5, 0), cwtdev.CWT_DEV_UNREADABLE)
+    test.case("no nbf is no lower bound")
+    test.assert_eq(cwtdev.check(scan_hex("a1" + "0418c8"), 0, 0), cwtdev.CWT_DEV_VALID)
+
+@test
+fn test_a_text_claim_is_compared_with_the_bytes_the_device_expects() [io]
+    var m = load(rich())
+    let c = cwtdev.scan(var m, whole(var m))
+    var want = load("617564")
+    test.case("the audience 'aud' is the audience 'aud'")
+    test.assert_eq(cwtdev.region_is(var m, c.aud, var want, Region { at: 0, len: 3 }), true)
+    test.case("the same length with a different byte")
+    var other = load("617565")
+    test.assert_eq(cwtdev.region_is(var m, c.aud, var other, Region { at: 0, len: 3 }), false)
+    test.case("a different length")
+    test.assert_eq(cwtdev.region_is(var m, c.aud, var want, Region { at: 0, len: 2 }), false)
+    test.case("a claim that is present and empty equals the empty string")
+    var blank = load("a10160")
+    let present = cwtdev.scan(var blank, Region { at: 0, len: 3 })
+    var empty = load("")
+    test.assert_eq(cwtdev.region_is(var blank, present.iss, var empty, Region { at: 0, len: 0 }), true)
+    test.case("an absent claim equals nothing, not even an empty string")
+    let none = scan_hex("a0")
+    var nothing = load("")
+    test.assert_eq(cwtdev.region_is(var m, none.iss, var nothing, Region { at: 0, len: 0 }), false)
+    test.case("the key identifier inside cnf is compared the same way")
+    var kid = load("6b31")
+    test.assert_eq(cwtdev.region_is(var m, c.cnf_kid, var kid, Region { at: 0, len: 2 }), true)
+
+@test
+fn test_the_cwt_tag_is_removed_into_a_second_buffer() [io]
+    test.case("tag 61 is there")
+    var src = load("d83d" + "d18443a10104a0")
+    test.assert_eq(cwtdev.is_tagged(var src, src.len()), true)
+    var dst: Vec[u8; 512] = Vec.new()
+    test.assert_eq(cwtdev.unwrap(var src, src.len(), var dst), 7)
+    test.assert_eq(dst.len(), 7)
+    test.assert_eq(dst[0] as Int, 0xd1)
+    test.case("no tag: the message is copied as it is")
+    var bare = load("d18443a10104a0")
+    test.assert_eq(cwtdev.is_tagged(var bare, bare.len()), false)
+    test.assert_eq(cwtdev.unwrap(var bare, bare.len(), var dst), 7)
+    test.assert_eq(dst[0] as Int, 0xd1)
+    test.case("a COSE tag is not the CWT tag")
+    var cose_only = load("d280")
+    test.assert_eq(cwtdev.is_tagged(var cose_only, 2), false)
+    test.case("a size past the bytes held, and a negative one")
+    test.assert_eq(cwtdev.unwrap(var src, 600, var dst), -1)
+    test.assert_eq(cwtdev.unwrap(var src, -1, var dst), -1)
+    test.case("a buffer that is not a head at all reads as untagged")
+    var cut = load("18")
+    test.assert_eq(cwtdev.is_tagged(var cut, 1), false)
+    test.case("a destination that held bytes is cleared first")
+    test.assert_eq(cwtdev.unwrap(var bare, 3, var dst), 3)
+    test.assert_eq(dst.len(), 3)

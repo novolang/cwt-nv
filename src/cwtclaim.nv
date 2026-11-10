@@ -1,0 +1,121 @@
+// cwtclaim.nv — the claim keys of RFC 8392 and the ranges that govern them.
+//
+// A CWT claims set is a CBOR map.  Its keys are integers or text strings,
+// and the integers are allocated from one registry whose ranges decide who
+// may use a number (RFC 8392 section 9.1, the CBOR Web Token Claims
+// registry).  The registered claims are the issuer (1), the subject (2),
+// the audience (3), the expiration time (4), the not-before time (5), the
+// issued-at time (6) and the token identifier (7).  Key 8, `cnf`, is the
+// confirmation claim of RFC 8747 and RFC 9200 builds on it.
+//
+// `cose-nv` reads the seven registered claims into a `CwtClaims` and keeps
+// every other pair in `extra`.  The functions here are what a program needs
+// to read and write those other pairs by key, and to choose a key that
+// cannot collide with a registered one.
+
+use std.list
+use cborfmt
+use coseerr
+use cosecbor
+use cosecwt
+
+// The confirmation claim, RFC 8747 section 3.1.
+pub const CWT_CNF = 8
+
+// The range of a claim key that is reserved: only 0.
+pub const CWT_RANGE_RESERVED = 0
+// The range of -256 to 255, allocated by Standards Action.
+pub const CWT_RANGE_STANDARD = 1
+// The range of -65536 to -257 and 256 to 65535, allocated by Specification
+// Required.
+pub const CWT_RANGE_SPECIFICATION = 2
+// The range above 65535, allocated by Expert Review.
+pub const CWT_RANGE_EXPERT = 3
+// The range below -65536, which is for private use and is never allocated.
+pub const CWT_RANGE_PRIVATE = 4
+
+// The highest integer claim key that is for private use: -65537.
+pub const CWT_PRIVATE_MAX = 0 - 65537
+
+// Which range of the registry an integer claim key belongs to (RFC 8392
+// section 9.1.1).
+//
+// ```novo
+// use cwtclaim
+//
+// fn main() [io]
+//     println("${cwtclaim.key_range(4)}")          // 1, standards action
+//     println("${cwtclaim.key_range(0 - 70000)}")  // 4, private use
+// ```
+pub fn key_range(key: Int) -> Int []
+    if key == 0
+        CWT_RANGE_RESERVED
+    else if key >= 0 - 256 and key <= 255
+        CWT_RANGE_STANDARD
+    else if key >= 0 - 65536 and key <= 65535
+        CWT_RANGE_SPECIFICATION
+    else if key > 65535
+        CWT_RANGE_EXPERT
+    else
+        CWT_RANGE_PRIVATE
+
+// Whether a claim key is in the private-use range.
+pub fn is_private(key: Int) -> Bool []
+    key_range(key) == CWT_RANGE_PRIVATE
+
+// Whether a key is one of the seven registered claims of RFC 8392, which
+// `CwtClaims` holds in fields of their own.
+pub fn is_registered(key: Int) -> Bool []
+    key >= 1 and key <= 7
+
+// The value of an integer-keyed claim that `CwtClaims` does not hold in a
+// field: `cnf`, a private claim, or any other.  Nothing for a registered
+// claim, which is in its field, and for a key that is absent.
+pub fn claim_of(c: CwtClaims, key: Int) -> ?CborValue []
+    cosecbor.find(c.extra, key)
+
+// A pair for a private-use claim.
+//
+// Refuses `CwtBadClaim` for a key outside the private-use range: a number
+// from another range may be allocated to a different meaning later.
+pub fn private_claim(key: Int, value: CborValue) -> Result<CborPair, CoseError> []
+    if is_private(key)
+        Ok(CborPair { key: cosecbor.int_value(key), value: value })
+    else
+        Err(CwtBadClaim(key))
+
+// A claims set with one more claim, under an integer key outside the seven
+// registered ones.
+//
+// Refuses `CwtBadClaim` for a registered key, whose value belongs in the
+// field, and `CoseDuplicateLabel` for a key the set already holds.
+//
+// ```novo
+// use cborfmt
+// use cosecwt
+// use cwtclaim
+//
+// fn main() [io]
+//     let c = cosecwt.claims_empty()
+//     match cwtclaim.with_claim(c, 0 - 70000, CborText("lab-3"))
+//         Ok(next) => println("${cwtclaim.claim_of(next, 0 - 70000) != None}")   // true
+//         Err(e)   => println(e.message())
+// ```
+pub fn with_claim(c: CwtClaims, key: Int, value: CborValue) -> Result<CwtClaims, CoseError> []
+    if is_registered(key)
+        return Err(CwtBadClaim(key))
+    if cosecbor.find(c.extra, key) != None
+        return Err(CoseDuplicateLabel(key))
+    var extra = c.extra[:]
+    list.push(extra, CborPair { key: cosecbor.int_value(key), value: value })
+    Ok(CwtClaims { iss: c.iss, sub: c.sub, aud: c.aud, exp: c.exp, nbf: c.nbf, iat: c.iat, cti: c.cti,
+                   extra: extra })
+
+// A claims set without the claim under `key` in `extra`.
+pub fn without_claim(c: CwtClaims, key: Int) -> CwtClaims []
+    var extra: [CborPair] = []
+    for p in c.extra
+        if cosecbor.int_of(p.key) != Some(key)
+            list.push(extra, p)
+    CwtClaims { iss: c.iss, sub: c.sub, aud: c.aud, exp: c.exp, nbf: c.nbf, iat: c.iat, cti: c.cti,
+                extra: extra }

@@ -1,0 +1,110 @@
+// tests/embedded_probe.nv — the device claim of cwtdev, as a program that
+// either builds for a Cortex-M or does not.
+//
+// The shard audit's `core-embedded` row copies this and the modules of the
+// package that are not named in `host_modules` into a package of its own and
+// runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  `--target=nrf52-qemu`
+// checks every function it compiles at `@tier(embedded)`, so a string, a
+// list literal or an unbounded loop in `cwtdev` is refused.
+//
+// The firmware is a door controller that is handed a CWT.  It takes the CWT
+// tag off the token, finds the COSE_Mac0 and its key identifier, reads the
+// claims, judges the times against its clock, and compares the audience and
+// the issuer with the strings it was provisioned with.  The token is the
+// MACed CWT of RFC 8392 appendix A.4, 114 bytes; checking its HMAC is the
+// device's own, so the probe stops at the string the tag would be computed
+// over.  A second claims set, built here, carries a `cnf` claim.
+
+use cosedev
+use cwtdev
+
+// RFC 8392 appendix A.4: tag 61, tag 17, a COSE_Mac0 under HMAC 256/64.
+const TOKEN = [
+    0xd8, 0x3d, 0xd1, 0x84, 0x43, 0xa1, 0x01, 0x04, 0xa1, 0x04, 0x4c, 0x53,
+    0x79, 0x6d, 0x6d, 0x65, 0x74, 0x72, 0x69, 0x63, 0x32, 0x35, 0x36, 0x58,
+    0x50, 0xa7, 0x01, 0x75, 0x63, 0x6f, 0x61, 0x70, 0x3a, 0x2f, 0x2f, 0x61,
+    0x73, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f,
+    0x6d, 0x02, 0x65, 0x65, 0x72, 0x69, 0x6b, 0x77, 0x03, 0x78, 0x18, 0x63,
+    0x6f, 0x61, 0x70, 0x3a, 0x2f, 0x2f, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x2e,
+    0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x04,
+    0x1a, 0x56, 0x12, 0xae, 0xb0, 0x05, 0x1a, 0x56, 0x10, 0xd9, 0xf0, 0x06,
+    0x1a, 0x56, 0x10, 0xd9, 0xf0, 0x07, 0x42, 0x0b, 0x71, 0x48, 0x09, 0x31,
+    0x01, 0xef, 0x6d, 0x78, 0x92, 0x00]
+
+// The audience the controller answers to: "coap://light.example.com".
+const AUDIENCE = [
+    0x63, 0x6f, 0x61, 0x70, 0x3a, 0x2f, 0x2f, 0x6c, 0x69, 0x67, 0x68, 0x74,
+    0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d]
+
+// A claims set with a proof-of-possession key: {4: 1000, 8: {3: h'6b31'}}.
+const BOUND = [0xa2, 0x04, 0x19, 0x03, 0xe8, 0x08, 0xa1, 0x03, 0x42, 0x6b, 0x31]
+
+// Copy `n` bytes of a table into a buffer.
+@tier(embedded)
+@no_alloc
+fn load(var m: Vec[u8; 512], from_token: Bool) -> Int
+    m.clear()
+    if from_token
+        for i in 0..114
+            let _p = m.push(TOKEN[i] as u8)
+    else
+        for i in 0..11
+            let _p = m.push(BOUND[i] as u8)
+    m.len()
+
+// The audience table in a buffer of its own.
+@tier(embedded)
+@no_alloc
+fn load_audience(var m: Vec[u8; 512]) -> Int
+    m.clear()
+    for i in 0..24
+        let _p = m.push(AUDIENCE[i] as u8)
+    m.len()
+
+// Everything the firmware decides, folded into one number: a single
+// comparison on the device decides the run, so a passing run means every
+// step came out right and not only that the calls linked.
+@tier(embedded)
+@no_alloc
+fn score() -> Int
+    var n = 0
+    var raw: Vec[u8; 512] = Vec.new()
+    var m: Vec[u8; 512] = Vec.new()
+    let size = load(var raw, true)
+    if cwtdev.is_tagged(var raw, size)
+        n = n + 1
+    let body = cwtdev.unwrap(var raw, size, var m)
+    let v: CoseView = cosedev.parse_mac0(var m, body)
+    if v.ok and v.has_alg and v.alg == 4 and v.kid.len == 12
+        n = n + 1
+    let c: CwtDevClaims = cwtdev.scan(var m, v.payload)
+    if c.ok and c.iss.len == 21 and c.sub.len == 5 and c.cti.len == 2
+        n = n + 1
+    if cwtdev.check(c, 1444000000, 0) == cwtdev.CWT_DEV_VALID
+        n = n + 1
+    if cwtdev.check(c, 1444064944, 0) == cwtdev.CWT_DEV_EXPIRED
+        n = n + 1
+    var want: Vec[u8; 512] = Vec.new()
+    let wl = load_audience(var want)
+    if cwtdev.region_is(var m, c.aud, var want, Region { at: 0, len: wl })
+        n = n + 1
+    var out: Vec[u8; 512] = Vec.new()
+    var aad: Vec[u8; 512] = Vec.new()
+    if cosedev.mac_structure0(var out, var m, v.protected, var aad, v.payload)
+        n = n + 1
+    var b: Vec[u8; 512] = Vec.new()
+    let bsize = load(var b, false)
+    let k: CwtDevClaims = cwtdev.scan(var b, Region { at: 0, len: bsize })
+    if k.ok and k.cnf_kid.len == 2 and k.cnf.len == 5 and cwtdev.check(k, 999, 0) == cwtdev.CWT_DEV_VALID
+        n = n + 1
+    n
+
+fn main() [hw]
+    if score() == 8
+        hal.uart.write("PASS: cwt-embedded\n")
+    else
+        hal.uart.write("FAIL: cwt-embedded\n")

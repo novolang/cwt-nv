@@ -1,0 +1,309 @@
+// cwt_claim_tests.nv — the claim keys and their ranges, the confirmation
+// claim of RFC 8747, and the rules a claims set is checked against.
+//
+// The byte strings of the confirmation claim are derived by hand from
+// RFC 8747 section 3.1, and the derivation is in each comment.  The
+// COSE_Key inside them is an Ed25519 public key, RFC 9053 section 7.2:
+//   a4            map of 4
+//   01 01         kty 1 = OKP
+//   02 42 6b 31   kid 2 = h'6b31' ("k1")
+//   20 06         crv -1 = 6, Ed25519
+//   21 58 20 ...  x -2 = the 32 bytes of the public key
+
+use std.test
+use std.bytes
+use cborfmt
+use coseerr
+use cosekey
+use cosecwt
+use cwtcheck
+use cwtclaim
+use cwtcnf
+
+fn h(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+fn hex(b: Bytes) -> Str
+    bytes.to_hex(b)
+
+fn said<T>(r: Result<T, CoseError>) -> Str
+    match r
+        Ok(_)  => "ok"
+        Err(e) => e.message()
+
+fn blank() -> CwtClaims
+    cosecwt.claims_empty()
+
+fn public_key() -> CoseKey
+    cosekey.with_kid(cosekey.ed25519(h("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"), None),
+                     h("6b31"))
+
+fn full() -> CwtClaims
+    CwtClaims { iss: Some("coap://as.example.com"), sub: Some("erikw"), aud: Some("coap://light.example.com"),
+                exp: Some(2000), nbf: Some(1000), iat: Some(900), cti: Some(h("0b71")), extra: [] }
+
+@test
+fn test_a_claim_key_belongs_to_the_range_the_registry_gives_it() [io]
+    test.case("zero is reserved")
+    test.assert_eq(cwtclaim.key_range(0), cwtclaim.CWT_RANGE_RESERVED)
+    test.case("-256 to 255 is for standards action, at both edges")
+    test.assert_eq(cwtclaim.key_range(1), cwtclaim.CWT_RANGE_STANDARD)
+    test.assert_eq(cwtclaim.key_range(255), cwtclaim.CWT_RANGE_STANDARD)
+    test.assert_eq(cwtclaim.key_range(0 - 256), cwtclaim.CWT_RANGE_STANDARD)
+    test.case("256 to 65535 and -65536 to -257 need a specification")
+    test.assert_eq(cwtclaim.key_range(256), cwtclaim.CWT_RANGE_SPECIFICATION)
+    test.assert_eq(cwtclaim.key_range(65535), cwtclaim.CWT_RANGE_SPECIFICATION)
+    test.assert_eq(cwtclaim.key_range(0 - 257), cwtclaim.CWT_RANGE_SPECIFICATION)
+    test.assert_eq(cwtclaim.key_range(0 - 65536), cwtclaim.CWT_RANGE_SPECIFICATION)
+    test.case("above 65535 is for expert review")
+    test.assert_eq(cwtclaim.key_range(65536), cwtclaim.CWT_RANGE_EXPERT)
+    test.case("below -65536 is private use, and the constant is its highest key")
+    test.assert_eq(cwtclaim.key_range(0 - 65537), cwtclaim.CWT_RANGE_PRIVATE)
+    test.assert_eq(cwtclaim.CWT_PRIVATE_MAX, 0 - 65537)
+    test.assert_eq(cwtclaim.is_private(0 - 65537), true)
+    test.assert_eq(cwtclaim.is_private(0 - 65536), false)
+
+@test
+fn test_the_seven_registered_claims_are_the_keys_one_to_seven() [io]
+    test.case("1 through 7")
+    test.assert_eq(cwtclaim.is_registered(1), true)
+    test.assert_eq(cwtclaim.is_registered(7), true)
+    test.case("0 and 8 are not")
+    test.assert_eq(cwtclaim.is_registered(0), false)
+    test.assert_eq(cwtclaim.is_registered(8), false)
+
+@test
+fn test_a_private_claim_is_a_pair_only_in_the_private_range() [io]
+    test.case("a key below -65536 gives the pair")
+    match cwtclaim.private_claim(0 - 70000, CborText("lab-3"))
+        Err(_) => test.fail("a private key was refused")
+        Ok(p)  => test.assert_eq_str(hex(cosecwt.claims_to_bytes(CwtClaims { iss: None, sub: None, aud: None,
+                                                                              exp: None, nbf: None, iat: None, cti: None,
+                                                                              extra: [p] })),
+                                     "a13a0001116f656c61622d33")
+    test.case("a key of another range is refused and names the key")
+    test.assert_eq_str(said(cwtclaim.private_claim(300, CborText("x"))), "cwt: claim 300 is malformed")
+
+@test
+fn test_a_claim_is_added_by_key_and_never_over_a_registered_or_held_one() [io]
+    test.case("added under a private key, found, and removed")
+    match cwtclaim.with_claim(blank(), 0 - 70000, CborText("lab-3"))
+        Err(_) => test.fail("with_claim refused a free key")
+        Ok(c)  =>
+            test.assert_eq(cwtclaim.claim_of(c, 0 - 70000) == Some(CborText("lab-3")), true)
+            test.case("the same key twice is a duplicate label")
+            test.assert_eq_str(said(cwtclaim.with_claim(c, 0 - 70000, CborText("again"))),
+                               "cose: header label -70000 appears in both buckets or twice")
+            test.case("without_claim leaves the other claims and drops this one")
+            let gone = cwtclaim.without_claim(c, 0 - 70000)
+            test.assert_eq(cwtclaim.claim_of(gone, 0 - 70000) == None, true)
+            test.case("a claim under another key is kept when one is dropped")
+            match cwtclaim.with_claim(c, 0 - 70001, CborBool(true))
+                Err(_)  => test.fail("with_claim refused a free key")
+                Ok(two) =>
+                    let one = cwtclaim.without_claim(two, 0 - 70000)
+                    test.assert_eq(cwtclaim.claim_of(one, 0 - 70000) == None, true)
+                    test.assert_eq(cwtclaim.claim_of(one, 0 - 70001) == Some(CborBool(true)), true)
+    test.case("a registered key belongs in its field")
+    test.assert_eq_str(said(cwtclaim.with_claim(blank(), 4, CborUnsigned(1))), "cwt: claim 4 is malformed")
+    test.case("the other fields survive with_claim")
+    match cwtclaim.with_claim(full(), 100, CborBool(true))
+        Err(_) => test.fail("with_claim refused a free key")
+        Ok(c)  =>
+            test.assert_eq(c.iss, Some("coap://as.example.com"))
+            test.assert_eq(c.exp, Some(2000))
+            test.assert_eq_str(hex(c.cti ?? bytes.zeros(0)), "0b71")
+
+@test
+fn test_a_confirmation_is_one_method_in_a_map() [io]
+    test.case("method 3: a key identifier, a1 03 42 6b31")
+    test.assert_eq_str(hex(cwtcnf.to_bytes(CnfKid(h("6b31")))), "a103426b31")
+    test.case("method 1: a COSE_Key, a1 01 followed by the key's map")
+    test.assert_eq_str(hex(cwtcnf.to_bytes(CnfKey(public_key()))),
+                       "a101a4010102426b3120062158" + "20d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    test.case("method 2: an encrypted key is any COSE_Encrypt0 array, here tag 16 on three items")
+    let enc = CborTagged(16, CborArray([CborBytes(h("a1010a")), CborMap([]), CborBytes(h("00"))]))
+    test.assert_eq_str(hex(cwtcnf.to_bytes(CnfEncrypted(enc))), "a102d08343a1010aa04100")
+    test.case("the map before it is encoded")
+    test.assert_eq(cwtcnf.to_value(CnfKid(h("6b31"))) == CborMap([CborPair { key: CborUnsigned(3), value: CborBytes(h("6b31")) }]),
+        true)
+    test.case("the method number of each")
+    test.assert_eq(cwtcnf.method_of(CnfKey(public_key())), 1)
+    test.assert_eq(cwtcnf.method_of(CnfEncrypted(enc)), 2)
+    test.assert_eq(cwtcnf.method_of(CnfKid(h("6b31"))), 3)
+
+@test
+fn test_a_confirmation_is_read_back_by_method() [io]
+    test.case("method 1 gives the key with its kid")
+    match cwtcnf.from_bytes(cwtcnf.to_bytes(CnfKey(public_key())))
+        Ok(CnfKey(k)) =>
+            test.assert_eq(k.kty, 1)
+            test.assert_eq_str(hex(k.kid ?? bytes.zeros(0)), "6b31")
+        _             => test.fail("method 1 did not read as a key")
+    test.case("method 2 gives the array back")
+    match cwtcnf.from_bytes(h("a102d08343a1010aa04100"))
+        Ok(CnfEncrypted(m)) => test.assert_eq_str(hex(cwtcnf.to_bytes(CnfEncrypted(m))), "a102d08343a1010aa04100")
+        _                   => test.fail("method 2 did not read as an encrypted key")
+    test.case("method 2 also accepts a COSE_Encrypt that is an untagged array")
+    match cwtcnf.from_bytes(h("a1028340a04100"))
+        Ok(CnfEncrypted(_)) => test.assert_eq(1, 1)
+        _                   => test.fail("an untagged array was refused")
+    test.case("method 3 gives the identifier")
+    match cwtcnf.from_bytes(h("a103426b31"))
+        Ok(CnfKid(k)) => test.assert_eq_str(hex(k), "6b31")
+        _             => test.fail("method 3 did not read as an identifier")
+
+@test
+fn test_a_confirmation_that_is_not_one_known_method_is_refused() [io]
+    test.case("not a map")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("4100"))), "cwt: claim 8 is malformed")
+    test.case("an empty map has no method")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a0"))), "cwt: claim 8 is malformed")
+    test.case("two methods are one too many")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a203410004" + "4100"))), "cwt: claim 8 is malformed")
+    test.case("a method this package does not know, 4")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a1044100"))), "cwt: claim 8 is malformed")
+    test.case("a text key is not a method")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a1616b4100"))), "cwt: claim 8 is malformed")
+    test.case("a kid that is not bytes")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a10301"))), "cwt: claim 8 is malformed")
+    test.case("an encrypted key that is not an array")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a10241" + "00"))), "cwt: claim 8 is malformed")
+    test.case("a COSE_Key that is not a map is the key reader's refusal")
+    test.assert_eq_str(said(cwtcnf.from_bytes(h("a10101"))), "cose: unusable key: a COSE_Key is a map")
+    test.case("a value that is not a map, read without the encoding")
+    test.assert_eq_str(said(cwtcnf.from_value(CborUnsigned(1))), "cwt: claim 8 is malformed")
+    test.case("bytes that are not CBOR")
+    test.assert_eq(said(cwtcnf.from_bytes(h("ff"))) == "ok", false)
+
+@test
+fn test_a_claims_set_carries_one_confirmation_and_a_second_replaces_it() [io]
+    test.case("a set with none")
+    test.assert_eq(cwtcnf.cnf_of(blank()), Ok(None))
+    test.case("with_cnf sets it, and cnf_of reads it")
+    let bound = cwtcnf.with_cnf(full(), CnfKid(h("6b31")))
+    test.assert_eq(cwtcnf.cnf_of(bound), Ok(Some(CnfKid(h("6b31")))))
+    test.assert_eq(bound.exp, Some(2000))
+    test.case("the set is written with key 8 after the registered claims")
+    test.assert_eq_str(hex(cosecwt.claims_to_bytes(cwtcnf.with_cnf(blank(), CnfKid(h("6b31"))))),
+                       "a108a103426b31")
+    test.case("a second confirmation replaces the first")
+    let again = cwtcnf.with_cnf(bound, CnfKid(h("6b32")))
+    test.assert_eq(cwtcnf.cnf_of(again), Ok(Some(CnfKid(h("6b32")))))
+    test.case("a malformed confirmation in a set is the reader's refusal")
+    test.assert_eq_str(said(cwtcnf.cnf_of(CwtClaims { iss: None, sub: None, aud: None, exp: None, nbf: None,
+                                                    iat: None, cti: None,
+                                                    extra: [CborPair { key: CborUnsigned(8), value: CborUnsigned(1) }] })),
+                       "cwt: claim 8 is malformed")
+
+@test
+fn test_a_confirmation_names_a_key_by_identifier_or_carries_it() [io]
+    test.case("a kid method names its identifier and no other")
+    test.assert_eq(cwtcnf.names_kid(CnfKid(h("6b31")), h("6b31")), true)
+    test.assert_eq(cwtcnf.names_kid(CnfKid(h("6b31")), h("6b32")), false)
+    test.case("a COSE_Key names the kid it carries")
+    test.assert_eq(cwtcnf.names_kid(CnfKey(public_key()), h("6b31")), true)
+    test.assert_eq(cwtcnf.names_kid(CnfKey(public_key()), h("6b32")), false)
+    test.case("a COSE_Key without a kid names none")
+    test.assert_eq(cwtcnf.names_kid(CnfKey(cosekey.symmetric(h("00"))), h("6b31")), false)
+    test.case("an encrypted key names nothing until it is opened")
+    test.assert_eq(cwtcnf.names_kid(CnfEncrypted(CborArray([])), h("6b31")), false)
+    test.case("only method 1 hands the key over")
+    test.assert_eq(cwtcnf.key_of(CnfKey(public_key())) == None, false)
+    test.assert_eq(cwtcnf.key_of(CnfKid(h("6b31"))) == None, true)
+
+@test
+fn test_the_times_are_checked_at_their_edges_with_and_without_leeway() [io]
+    let c = full()
+    test.case("one second before exp is valid, at exp it is expired")
+    test.assert_eq_str(said(cwtcheck.check(c, cwtcheck.rules_at(1999))), "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, cwtcheck.rules_at(2000))), "cwt: expired at 2000, now 2000")
+    test.case("at nbf it is valid, one before it is not yet valid")
+    test.assert_eq_str(said(cwtcheck.check(c, cwtcheck.rules_at(1000))), "ok")
+    test.assert_eq_str(said(cwtcheck.check(c, cwtcheck.rules_at(999))), "cwt: not valid before 1000, now 999")
+    test.case("leeway moves both edges outward by its seconds")
+    let wide = CwtRules { now: 2009,
+        leeway: 10,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, wide)), "ok")
+    let edge = CwtRules { now: 2010,
+        leeway: 10,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, edge)), "cwt: expired at 2000, now 2010")
+    let early = CwtRules { now: 990,
+        leeway: 10,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, early)), "ok")
+    let earlier = CwtRules { now: 989,
+        leeway: 10,
+        issuers: [],
+        audience: None,
+        require_exp: true,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(c, earlier)), "cwt: not valid before 1000, now 989")
+
+@test
+fn test_a_missing_time_is_refused_only_when_the_rules_require_it() [io]
+    test.case("no exp: refused by default, accepted when not required")
+    test.assert_eq_str(said(cwtcheck.check(blank(), cwtcheck.rules_at(5))), "cwt: claim 4 is required and absent")
+    let lax = CwtRules { now: 5,
+        leeway: 0,
+        issuers: [],
+        audience: None,
+        require_exp: false,
+        require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(blank(), lax)), "ok")
+    test.case("no nbf: accepted by default, refused when required")
+    let strict = CwtRules { now: 5,
+        leeway: 0,
+        issuers: [],
+        audience: None,
+        require_exp: false,
+        require_nbf: true }
+    test.assert_eq_str(said(cwtcheck.check(blank(), strict)), "cwt: claim 5 is required and absent")
+
+@test
+fn test_the_issuer_must_be_one_of_the_trusted_and_the_audience_the_recipient() [io]
+    let issuers = CwtRules { now: 1500, leeway: 0, issuers: ["https://other", "coap://as.example.com"], audience: None,
+                             require_exp: true, require_nbf: false }
+    test.case("an issuer in the list passes")
+    test.assert_eq_str(said(cwtcheck.check(full(), issuers)), "ok")
+    test.case("an issuer outside the list is refused")
+    let stranger = CwtRules { now: 1500, leeway: 0, issuers: ["https://other"], audience: None, require_exp: true,
+                              require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(full(), stranger)), "cwt: the issuer is not the one required")
+    test.case("a token with no issuer fails a list")
+    test.assert_eq_str(said(cwtcheck.check(CwtClaims { iss: None, sub: None, aud: None, exp: Some(2000), nbf: None,
+                                                    iat: None, cti: None, extra: [] },
+                                                    issuers)),
+                       "cwt: the issuer is not the one required")
+    test.case("an empty list accepts any issuer, and none")
+    test.assert_eq_str(said(cwtcheck.check(full(), cwtcheck.rules_at(1500))), "ok")
+    test.case("the audience must equal the recipient's identifier")
+    let aud = CwtRules { now: 1500, leeway: 0, issuers: [], audience: Some("coap://light.example.com"),
+                         require_exp: true, require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(full(), aud)), "ok")
+    let wrong = CwtRules { now: 1500, leeway: 0, issuers: [], audience: Some("coap://heater.example.com"),
+                           require_exp: true, require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(full(), wrong)), "cwt: the audience is not the one required")
+    test.case("a token with no audience fails a recipient that names itself")
+    test.assert_eq_str(said(cwtcheck.check(CwtClaims { iss: None, sub: None, aud: None, exp: Some(2000), nbf: None,
+                                                    iat: None, cti: None, extra: [] },
+                                                    aud)),
+                       "cwt: the audience is not the one required")
+    test.case("the issuer is judged before the audience, the audience before the times")
+    let both = CwtRules { now: 5000, leeway: 0, issuers: ["https://other"], audience: Some("x"), require_exp: true,
+                          require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(full(), both)), "cwt: the issuer is not the one required")
+    let aud_then_time = CwtRules { now: 5000, leeway: 0, issuers: [], audience: Some("x"), require_exp: true,
+                                   require_nbf: false }
+    test.assert_eq_str(said(cwtcheck.check(full(), aud_then_time)), "cwt: the audience is not the one required")
